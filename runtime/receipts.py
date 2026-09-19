@@ -31,6 +31,11 @@ DB = os.environ.get("SWARM_RECEIPTS_DB", "/var/lib/swarm/receipts.db")
 GENESIS = "0" * 64
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS chain_breaks(
+  seq        INTEGER PRIMARY KEY,     -- the row whose prev_hash does not match
+  noted_at   REAL NOT NULL,
+  reason     TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS receipts(
   seq        INTEGER PRIMARY KEY AUTOINCREMENT,
   ts         REAL NOT NULL,
@@ -94,14 +99,33 @@ def settle(db, seq, proof, ok):
 
 
 def verify_chain(db):
-    """Recompute every row's hash. Returns the first seq that does not match, or None."""
+    """Recompute every row's hash. Returns the first UNEXPLAINED break, or None.
+
+    A break that has been written down in chain_breaks is skipped - not because it is acceptable,
+    but because it is permanent: the only way to make the chain verify again would be to re-hash
+    every row after it, which is rewriting the history the chain exists to protect. Acknowledging it
+    keeps detection working for everything that comes after. An unrecorded break is still returned.
+    """
+    known = {seq for (seq,) in db.execute("SELECT seq FROM chain_breaks")}
     prev = GENESIS
     for seq, ts, agent, kind, target, idem, intent, prev_hash, row_hash in db.execute(
             "SELECT seq, ts, agent, kind, target, idem, intent, prev_hash, row_hash FROM receipts ORDER BY seq"):
         if prev_hash != prev or _hash(prev, ts, agent, kind, target, idem, intent) != row_hash:
-            return seq
+            if seq not in known:
+                return seq
         prev = row_hash
     return None
+
+
+def note_break(db, seq, reason):
+    """Write a break down, with why. Only ever called by a person who has looked at it."""
+    db.execute("INSERT OR REPLACE INTO chain_breaks(seq, noted_at, reason) VALUES (?,?,?)",
+               (int(seq), time.time(), str(reason)[:500]))
+
+
+def breaks(db):
+    return [{"seq": s, "noted_at": t, "reason": r}
+            for s, t, r in db.execute("SELECT seq, noted_at, reason FROM chain_breaks ORDER BY seq")]
 
 
 # ---------------------------------------------------------------- proofs from the world
@@ -151,5 +175,7 @@ def counts(db, agent=None, since=None):
     for kind, ok, n in db.execute(
             f"SELECT kind, ok, COUNT(*) FROM receipts{clause} GROUP BY kind, ok", args):
         slot = out.setdefault(kind, {"proved": 0, "failed": 0, "unsettled": 0})
-        slot["unsettled" if ok is None else ("proved" if ok else "failed")] += 1
+        # by n, not by 1: the query returns one row PER GROUP, and counting groups reported
+        # "proved 1, failed 1" for 2 proved and 17 failed - wrong, and plausible enough to believe.
+        slot["unsettled" if ok is None else ("proved" if ok else "failed")] += n
     return out
