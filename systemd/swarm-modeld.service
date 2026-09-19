@@ -1,0 +1,18 @@
+[Unit]
+Description=swarm model daemon — one provider connection, one budget, for every agent on the box
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=SWARM_ENV=/etc/swarm/env
+Environment=SWARM_MODEL_SOCK=/run/swarm/model.sock
+Environment=SWARM_DAILY_USD=3
+ExecStart=/opt/swarm/venv/bin/python /opt/swarm/swarm/modeld.py
+Restart=always
+RestartSec=5
+RuntimeDirectory=swarm
+MemoryHigh=100M
+MemoryMax=150M
+
+[Install]
+WantedBy=multi-user.target

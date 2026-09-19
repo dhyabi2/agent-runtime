@@ -1,0 +1,11 @@
+[Unit]
+Description=run swarm agent %i on a cadence (a turn is one process, never a daemon)
+
+[Timer]
+OnBootSec=60
+OnUnitInactiveSec=120
+AccuracySec=10
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

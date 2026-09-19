@@ -1,0 +1,20 @@
+[Unit]
+Description=swarm agent %i — autonomous, own cgroup, own clone
+After=swarm-modeld.service
+Requires=swarm-modeld.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/swarm/%i
+Environment=SWARM_AGENT=%i
+Environment=SWARM_AGENT_HOME=/srv/swarm/%i
+Environment=SWARM_MODEL_SOCK=/run/swarm/model.sock
+Environment=SWARM_JOURNAL_DB=/var/lib/swarm/journal.db
+Environment=NANO_PULSE_LIB=/opt/swarm/lib
+EnvironmentFile=-/etc/swarm/env
+ExecStart=/opt/swarm/venv/bin/python /opt/swarm/swarm/agent.py
+# The cap that a coroutine cannot have: one agent cannot OOM its neighbours.
+MemoryHigh=90M
+MemoryMax=110M
+TasksMax=48
+LimitNOFILE=8192
