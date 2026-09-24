@@ -9,20 +9,27 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import agent
 
 _LIVE = agent.JOURNAL_DB
+_LIVE_HOME = agent.HOME
 
 
 def setUpModule():
     """Point the module's constant, not the env var: agent binds JOURNAL_DB at import time, so an
     env change here arrives too late whenever something imported agent first. These tests run real
     commands through run_tool, which emits - without this they write fixtures into the live journal
-    and into the numbers used to judge the agent."""
-    import tempfile
+    and into the numbers used to judge the agent.
+
+    HOME needs the same treatment and did not get it: run_tool passes `cwd=str(HOME)`, whose default
+    /srv/swarm/<name> exists only on a provisioned box, so every case here raised FileNotFoundError on
+    a clone. It went unseen because the module could not be imported at all."""
+    import pathlib, tempfile
     agent.JOURNAL_DB = tempfile.mktemp(suffix=".db")
+    agent.HOME = pathlib.Path(tempfile.mkdtemp())
     assert agent.JOURNAL_DB != _LIVE
 
 
 def tearDownModule():
     agent.JOURNAL_DB = _LIVE
+    agent.HOME = _LIVE_HOME
 
 
 class ABlockIsAScript(unittest.TestCase):

@@ -29,7 +29,12 @@ MAX_TOOLS = int(os.environ.get("SWARM_MAX_TOOLS", "12"))
 MAX_TOKENS = int(os.environ.get("SWARM_MAX_TOKENS", "3000"))
 SELF_SHARE = float(os.environ.get("SWARM_SELF_SHARE", "0.5"))
 
-sys.path.insert(0, os.environ.get("NANO_PULSE_LIB", "/opt/swarm/lib"))
+# The default is the copy of the rail shipped in THIS checkout, not an install path that only exists
+# on a box the swarm already provisioned: a fresh clone has no /opt/swarm/lib, so the old default made
+# `import agent` raise ModuleNotFoundError before any configuration could be applied. The unit still
+# sets NANO_PULSE_LIB=/opt/swarm/lib explicitly, so a deployed agent keeps using the shared rail.
+sys.path.insert(0, os.environ.get(
+    "NANO_PULSE_LIB", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")))
 import journal  # noqa: E402  (the swarm's existing rail: same schema, same hub, same map)
 
 # Imported by path, not relatively: systemd runs this file as a script, where there is no
