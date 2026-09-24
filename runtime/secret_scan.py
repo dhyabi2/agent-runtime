@@ -5,7 +5,11 @@ not a guideline is that nobody is watching at 3am."""
 import re, subprocess, sys
 
 PATTERNS = [
-    ("nano seed/private key", re.compile(r"\b[0-9A-F]{64}\b")),
+    # Case-insensitive on purpose. A seed is 32 bytes of hex and nothing fixes its case: the way
+    # Python makes one, secrets.token_hex(32), returns it LOWERCASE, and account_from_seed reads
+    # either case through bytes.fromhex. An uppercase-only pattern refused half the shapes a real
+    # seed arrives in and published the other half.
+    ("nano seed/private key", re.compile(r"\b[0-9A-F]{64}\b", re.I)),
     ("nano-gpt key",          re.compile(r"\bsk-nano-[0-9a-f-]{16,}")),
     ("openai-style key",      re.compile(r"\bsk-[A-Za-z0-9_-]{24,}")),
     ("github token",          re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
