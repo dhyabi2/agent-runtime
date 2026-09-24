@@ -36,6 +36,23 @@ class ItStartsBothWays(unittest.TestCase):
                            capture_output=True, text=True, cwd=os.path.join(ROOT, "runtime"), env=self._env(), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr[-600:])
 
+    def test_it_imports_on_a_fresh_clone_with_nothing_configured(self):
+        """A clone is all a reader has. Every other law here hands the agent NANO_PULSE_LIB pointing at
+        this checkout's own lib/, so none of them could see that the DEFAULT named an install path no
+        clone contains - `import agent` raised ModuleNotFoundError: No module named 'journal' before a
+        single line of configuration could be read."""
+        e = dict(os.environ)
+        for k in ("NANO_PULSE_LIB", "SWARM_AGENT_HOME", "SWARM_JOURNAL_DB", "SWARM_RECEIPTS_DB"):
+            e.pop(k, None)
+        e["SWARM_AGENT_HOME"] = tempfile.mkdtemp()
+        r = subprocess.run([sys.executable, "-c", "import agent; print(agent.journal.__file__)"],
+                           capture_output=True, text=True, cwd=os.path.join(ROOT, "runtime"),
+                           env=e, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-600:])
+        self.assertEqual(os.path.realpath(r.stdout.strip()),
+                         os.path.realpath(os.path.join(ROOT, "lib", "journal.py")),
+                         "an unconfigured agent must load the journal shipped beside it")
+
     def test_the_unit_file_and_the_test_agree_on_the_entry_point(self):
         """If the unit ever stops running it as a script, this law should be revisited, not silently wrong."""
         unit = os.path.join(ROOT, "systemd", "swarm-agent@.service")
