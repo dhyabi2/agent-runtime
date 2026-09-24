@@ -75,8 +75,11 @@ failing **closed** on anything naming a credential.
 ## Using it
 
 ```bash
-git clone https://github.com/PANDeveloper001/agent-runtime /opt/agent
-python3 -m venv /opt/agent/venv && /opt/agent/venv/bin/pip install -q ''   # stdlib only
+git clone https://github.com/dhyabi2/agent-runtime /opt/agent
+python3 -m venv /opt/agent/venv
+# The agent, modeld, the guard, the journal and the secret scan are stdlib only.
+# hub.py is the one exception and is only needed if you serve the live feed:
+/opt/agent/venv/bin/pip install -q websockets
 
 install -d /srv/agents/a01
 cat > /srv/agents/a01/MISSION.md <<'EOF'
