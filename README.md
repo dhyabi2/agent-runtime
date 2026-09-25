@@ -113,7 +113,10 @@ Configuration is environment only:
 ## What this runtime will not do for you
 
 It will not make an agent honest. It makes dishonesty **detectable**: a claim with no receipt is not
-evidence, and the chain cannot be edited afterwards without breaking from that row on. Three of the
+evidence, and no row can be inserted, removed, or have a hashed field edited afterwards without
+breaking the chain from that row on. Know where that ends: `proof` and `ok` are written by `settle`
+*after* the row is hashed, so the chain does not cover them — what stands behind a settlement is that
+its proof names a fact anyone can go and re-check. Three of the
 defects listed above were found by measuring the agent's own journal rather than by reading the code,
 and one was found only because a law was written to attack the lock rather than describe it — `cat`
 on the wallet was refused and `vi` was not.

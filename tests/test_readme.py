@@ -10,6 +10,7 @@ Both laws below are derived from the tree rather than restated from it, so they 
 after the next dependency or the next rename.
 """
 import ast
+import inspect
 import os
 import re
 import sys
@@ -102,6 +103,36 @@ class TheReadmeCanBeFollowed(unittest.TestCase):
         missing = sorted(r for r in roots if r not in text)
         self.assertEqual(missing, [],
                          f"the units run from {missing}, which the README's install never creates")
+
+    def test_both_documents_name_the_columns_the_chain_does_not_cover(self):
+        """`receipts.py` is the part the README tells a reader to steal, and its claim was wider than
+        the code: "the chain cannot be edited afterwards without breaking from that row on". `row_hash`
+        is computed in `begin`, from `_hash`'s arguments; `settle` writes `proof` and `ok` afterwards,
+        so those two are outside it. A failed push can be rewritten as a proved one and `verify_chain`
+        returns None — demonstrated in `test_the_chain_covers_the_intent_and_not_the_settlement`.
+
+        Derived, not restated: the columns come from `settle`'s own SQL and the covered set from
+        `_hash`'s signature, so bringing the settlement inside the hash, or settling a different
+        column, changes what this law demands of the prose rather than leaving it stale."""
+        from runtime import receipts
+
+        covered = set(inspect.signature(receipts._hash).parameters)
+        sql = re.search(r"UPDATE\s+receipts\s+SET\s+(.*?)\s+WHERE",
+                        inspect.getsource(receipts.settle), re.S | re.I)
+        self.assertIsNotNone(sql, "settle no longer updates receipts; this law needs rewriting")
+        settled = {c.split("=")[0].strip() for c in sql.group(1).split(",")}
+        self.assertTrue(settled, "settle writes no column")
+
+        uncovered = sorted(settled - covered)
+        self.assertEqual(uncovered, sorted(settled),
+                         "settle now writes a hashed column — say so in both documents and fix this law")
+
+        for where, text in (("README.md", readme()),
+                            ("receipts.py's docstring", receipts.__doc__ or "")):
+            unnamed = [c for c in uncovered if f"`{c}`" not in text]
+            self.assertEqual(unnamed, [],
+                             f"{where} promises the chain covers the record but never names {unnamed} "
+                             f"as outside it, which is where a reader would be misled")
 
 
 if __name__ == "__main__":
