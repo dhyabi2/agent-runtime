@@ -67,6 +67,38 @@ class TheGateRefusesASeed(unittest.TestCase):
         """A gate that refuses everything is turned off within the week."""
         self.assertEqual(scan_text("the agent pushed to origin/main and the remote SHA matched\n"), [])
 
+    def test_a_placeholder_elsewhere_on_the_line_does_not_excuse_a_real_seed(self):
+        """The allow list was searched against the WHOLE LINE, and three of its patterns describe the
+        shape of a fake value rather than saying anything about intent: `<[a-z-]+>` matches any bare
+        HTML tag, `xxx+` matches an `XXX` todo marker, `0{16,}` matches any raw XNO amount. So a real
+        seed was published for sharing a line with `<code>`, `<br>`, `XXX`, or an amount in raw."""
+        for label, line in (
+            ("<code> wrapper", "<code>SEED=" + self.SEED.lower() + "</code>"),
+            ("trailing <br>", "seed: " + self.SEED.lower() + "<br>"),
+            ("XXX todo", "seed = " + self.SEED.lower() + "  # XXX rotate this later"),
+            ("raw amount", "seed " + self.SEED.lower() + " tip 1000000000000000000000000 raw"),
+        ):
+            with self.subTest(case=label):
+                hits = scan_text(line + "\n")
+                self.assertEqual(len(hits), 1, f"a seed beside {label} was not refused")
+                self.assertEqual(hits[0][2], "nano seed/private key")
+
+    def test_a_redacted_value_is_still_not_a_finding(self):
+        """The other half of the same law. A placeholder that IS the match stays exempt, otherwise
+        every README that shows a key's shape refuses the next push."""
+        for label, line in (
+            ("redacted github token", "GITHUB_TOKEN=ghp_" + "x" * 24),
+            ("all-zero test seed", "seed = " + "0" * 64),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(scan_text(line + "\n"), [], f"{label} should not be a finding")
+
+    def test_an_annotation_still_exempts_its_whole_line(self):
+        """`# test-fixture: a PUBLIC key, never a seed` is how the swarm marks a deliberate value, and
+        it is a statement about the line, not about the shape of what is on it. That stays line-wide."""
+        self.assertEqual(
+            scan_text("public_key = " + self.SEED.lower() + "  # test-fixture: a PUBLIC key\n"), [])
+
     def test_the_published_tree_passes_its_own_gate(self):
         """Whatever the patterns are, this repository must be publishable by them - otherwise the
         hook that runs before every push refuses every push."""
