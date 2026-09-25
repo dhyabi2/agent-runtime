@@ -26,7 +26,7 @@ to work. That is the whole design goal.
 
 ## The four ideas
 
-**1. A turn is a process.** `agent@.service` is a `oneshot` fired by a timer. There is no long-lived
+**1. A turn is a process.** `swarm-agent@.service` is a `oneshot` fired by a timer. There is no long-lived
 process whose context can grow, so no compaction, no drift, and a crash costs exactly one turn.
 Continuity comes from `MEMORY.md` and `memory/YYYY-MM-DD.md` on disk, read fresh each time and
 bounded so a months-old agent still fits in a turn.
@@ -75,21 +75,28 @@ failing **closed** on anything naming a credential.
 ## Using it
 
 ```bash
-git clone https://github.com/dhyabi2/agent-runtime /opt/agent
-python3 -m venv /opt/agent/venv
+# The units in systemd/ are the ones production runs, verbatim, and they name absolute paths:
+# /opt/swarm for the checkout, /srv/swarm/<name> for each agent. The install builds those.
+git clone https://github.com/dhyabi2/agent-runtime /opt/swarm
+
+# The one rename publication introduced: this directory is `runtime/` in the repository and
+# `swarm/` on a box, which is where the units' ExecStart already points.
+mv /opt/swarm/runtime /opt/swarm/swarm
+
+python3 -m venv /opt/swarm/venv
 # The agent, modeld, the guard, the journal and the secret scan are stdlib only.
 # hub.py is the one exception and is only needed if you serve the live feed:
-/opt/agent/venv/bin/pip install -q websockets
+/opt/swarm/venv/bin/pip install -q websockets
 
-install -d /srv/agents/a01
-cat > /srv/agents/a01/MISSION.md <<'EOF'
+install -d /srv/swarm/a01
+cat > /srv/swarm/a01/MISSION.md <<'EOF'
 You are {name}. This turn's lane is **{lane}**. Your workspace is {home}.
 ... your instructions ...
 {state}
 EOF
 
 cp systemd/* /etc/systemd/system/
-systemctl enable --now agent-modeld.service agent@a01.timer
+systemctl enable --now swarm-modeld.service swarm-agent@a01.timer
 ```
 
 Configuration is environment only:
