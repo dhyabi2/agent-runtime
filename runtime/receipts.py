@@ -15,8 +15,18 @@ Three properties, each pinned by a law:
     visible as an intent with no receipt, instead of silently repeating or silently skipping;
   * the proof is external - a remote SHA, an on-chain block hash, an HTTP status and body hash - and
     is re-checked against the world, never taken from the agent;
-  * every row carries the hash of the row before it, so a receipt cannot be inserted, edited or
-    removed after the fact without breaking the chain from that point on.
+  * every row carries the hash of the row before it, so a receipt cannot be inserted or removed, and
+    no field the hash covers can be edited, without breaking the chain from that point on.
+
+WHAT THE CHAIN DOES NOT COVER. `row_hash` is computed in `begin`, from the fields that exist before
+the act: prev, ts, agent, kind, target, idem, intent. `proof` and `ok` are written afterwards by
+`settle` and are therefore OUTSIDE the hash - editing them breaks nothing, and `counts` will report
+the edited value. So the chain proves that an intent was recorded, in this order, and never altered;
+it does not by itself prove that the settlement attached to it is the one the world returned. Read
+`ok` as evidence only together with the `proof` blob, which names a fact anyone can go and re-check
+(a remote SHA, a block hash, a body digest) - that re-checkability, not the hash, is what stands
+behind a settlement. `test_the_chain_covers_the_intent_and_not_the_settlement` pins this boundary so
+the claim here and the code cannot drift apart again.
 """
 from __future__ import annotations
 
@@ -93,7 +103,11 @@ def begin(db, agent, kind, target, intent, idem=None):
 
 
 def settle(db, seq, proof, ok):
-    """Attach what the world actually returned. An intent left unsettled is a crash, visibly."""
+    """Attach what the world actually returned. An intent left unsettled is a crash, visibly.
+
+    `proof` and `ok` are written after `row_hash` was computed, so they are not covered by the chain
+    (see the module docstring). What makes a settlement checkable is the proof blob itself.
+    """
     db.execute("UPDATE receipts SET proof=?, ok=? WHERE seq=? AND proof IS NULL",
                (json.dumps(proof, sort_keys=True), 1 if ok else 0, seq))
 

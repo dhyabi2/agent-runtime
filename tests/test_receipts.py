@@ -34,14 +34,38 @@ class TheChainCannotBeRewritten(unittest.TestCase):
             R.settle(c, seq, {"sha": "x" * 40}, True)
         self.assertIsNone(R.verify_chain(c))
 
-    def test_editing_a_settled_row_breaks_the_chain_from_that_point(self):
-        """The whole point: a record nobody can quietly improve after the fact."""
+    def test_editing_a_hashed_field_breaks_the_chain_from_that_point(self):
+        """A record nobody can quietly improve after the fact — for the fields the hash covers."""
         c = db()
         for i in range(3):
             seq, _ = R.begin(c, "a01", "contact", f"https://example.com/{i}", {"n": i})
             R.settle(c, seq, {"status": 200}, True)
         c.execute("UPDATE receipts SET target='https://example.com/lie' WHERE seq=2")
         self.assertEqual(R.verify_chain(c), 2)
+
+    def test_the_chain_covers_the_intent_and_not_the_settlement(self):
+        """Where the tamper-evidence stops, pinned so the claim and the code cannot drift apart.
+
+        `row_hash` is computed in `begin`, from the fields that exist before the act. `proof` and
+        `ok` arrive afterwards from `settle`, so they are outside it: a failed act can be rewritten
+        as a proved one and `verify_chain` sees nothing. The module docstring and the README say so
+        in as many words; this law is why they cannot quietly stop saying it.
+
+        Should the settlement ever be brought inside the hash, this law is the thing that fails and
+        tells you to correct both documents — it describes a boundary, not a desirable property.
+        """
+        c = db()
+        seq, _ = R.begin(c, "a01", "push", "them/repo", {"branch": "main"})
+        R.settle(c, seq, {"in_sync": False, "remote_sha": ""}, False)
+        self.assertIsNone(R.verify_chain(c))
+        self.assertEqual(R.counts(c)["push"], {"proved": 0, "failed": 1, "unsettled": 0})
+
+        c.execute("UPDATE receipts SET proof=?, ok=1 WHERE seq=?",
+                  ('{"in_sync": true, "remote_sha": "' + "a" * 40 + '"}', seq))
+        self.assertIsNone(R.verify_chain(c), "if this now reports a break, the hash covers the "
+                                             "settlement: update the docstring and the README")
+        self.assertEqual(R.counts(c)["push"], {"proved": 1, "failed": 0, "unsettled": 0},
+                         "counts reports the edited value, which is the reason to say so plainly")
 
     def test_deleting_a_row_breaks_the_chain(self):
         c = db()
