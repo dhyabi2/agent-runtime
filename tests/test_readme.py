@@ -67,6 +67,42 @@ class TheReadmeCanBeFollowed(unittest.TestCase):
         self.assertEqual(missing, [],
                          f"the code imports {missing}, which the README never tells anyone to install")
 
+    def test_every_unit_the_readme_starts_is_one_the_repository_ships(self):
+        """The install path ended on `systemctl enable --now agent-modeld.service agent@a01.timer`,
+        and `cp systemd/*` installs `swarm-modeld.service`, `swarm-agent@.service` and
+        `swarm-agent@.timer`. Neither name existed, so the last command a reader runs answered
+        `Unit agent-modeld.service not found.`"""
+        shipped = set(os.listdir(os.path.join(ROOT, "systemd")))
+        named = re.findall(r"\b([\w.@-]+\.(?:service|timer))\b", readme())
+        self.assertTrue(named, "the README no longer tells a reader which units to start")
+        for unit in named:
+            # a template instance (foo@a01.timer) is shipped as its template (foo@.timer)
+            template = re.sub(r"@[^.]*\.", "@.", unit)
+            self.assertTrue(unit in shipped or template in shipped,
+                            f"the README starts {unit}, which `cp systemd/*` never installs")
+
+    def test_the_readme_installs_under_the_roots_the_units_run_from(self):
+        """The units are production's, verbatim, so their absolute paths are the install's contract:
+        ExecStart runs /opt/swarm/venv/bin/python on /opt/swarm/swarm/agent.py, WorkingDirectory is
+        /srv/swarm/%i, NANO_PULSE_LIB is /opt/swarm/lib. The README cloned to /opt/agent and made
+        /srv/agents/a01 instead, so every path the units need was missing after following it.
+
+        The roots are compared rather than the full paths: the install has to put the checkout and
+        the agent's home where the units look, and is free not to spell out each file beneath them."""
+        roots = set()
+        unitdir = os.path.join(ROOT, "systemd")
+        for name in sorted(os.listdir(unitdir)):
+            with open(os.path.join(unitdir, name), encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith(("ExecStart=", "WorkingDirectory=", "Environment=NANO_PULSE_LIB=")):
+                        roots.update("/".join(p.split("/")[:3])
+                                     for p in re.findall(r"/(?:opt|srv)/[\w./@%-]+", line))
+        self.assertTrue(roots, "the units no longer name any absolute path")
+        text = readme()
+        missing = sorted(r for r in roots if r not in text)
+        self.assertEqual(missing, [],
+                         f"the units run from {missing}, which the README's install never creates")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
