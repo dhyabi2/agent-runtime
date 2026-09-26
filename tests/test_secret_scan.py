@@ -8,6 +8,7 @@ Every fixture here is built by concatenation or generated at runtime, never writ
 so that this file cannot itself become the reason a push is refused.
 """
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -81,6 +82,101 @@ class TheGateRefusesASeed(unittest.TestCase):
             self.skipTest("not a git checkout")
         hits = secret_scan.scan([os.path.join(root, p) for p in tracked])
         self.assertEqual([(p, ln, k) for p, ln, k in hits], [])
+
+class TheGateNeverReportsCleanWithoutScanning(unittest.TestCase):
+    """Three ways the gate used to pass a push it had not actually checked.
+
+    Every one of them ends the same way: `hits == []`, exit 0, and the push goes out. For a hook whose
+    stated reason to exist is that nobody is watching at 3am, a silent skip is the worst failure it
+    has, because it is indistinguishable from a clean tree.
+    """
+
+    SEED = ("1a2b3c4d" * 8)
+
+    def _repo_with(self, filename):
+        """A git checkout holding one tracked file, named `filename`, carrying a seed."""
+        d = tempfile.mkdtemp()
+        for cmd in (["git", "init", "-q", "."],
+                    ["git", "config", "user.email", "a@b.c"],
+                    ["git", "config", "user.name", "t"]):
+            subprocess.run(cmd, cwd=d, check=True, capture_output=True)
+        with open(os.path.join(d, filename), "w", encoding="utf-8") as f:
+            f.write("SEED=" + self.SEED.lower() + "\n")
+        subprocess.run(["git", "add", "-A"], cwd=d, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "x"], cwd=d, check=True, capture_output=True)
+        return d
+
+    def _scan_tracked_in(self, d):
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            paths = secret_scan.tracked()
+        finally:
+            os.chdir(cwd)
+        return paths, secret_scan.scan([os.path.join(d, p) for p in paths])
+
+    def test_a_path_git_quotes_is_still_scanned(self):
+        """`git ls-files` applies core.quotePath, so any non-ASCII byte in a name comes back octal-
+        escaped and in quotes. open() cannot find that, the old code swallowed the OSError, and a file
+        holding a seed was reported clean. `-z` output is never quoted."""
+        for filename in ("caf\u00e9.py", "\u0440\u0430\u0439.py", "notes \u2014 draft.py"):
+            with self.subTest(filename=filename):
+                d = self._repo_with(filename)
+                paths, hits = self._scan_tracked_in(d)
+                self.assertEqual(paths, [filename], f"tracked() mangled the path: {paths}")
+                self.assertEqual([k for _, _, k in hits], ["nano seed/private key"], hits)
+
+    def test_a_path_with_a_space_is_still_scanned(self):
+        """Spaces never triggered quoting, so this already worked. Pinned so the -z change cannot
+        regress the ordinary case while fixing the exotic one."""
+        d = self._repo_with("my notes.py")
+        paths, hits = self._scan_tracked_in(d)
+        self.assertEqual(paths, ["my notes.py"])
+        self.assertEqual([k for _, _, k in hits], ["nano seed/private key"], hits)
+
+    def test_a_path_that_cannot_be_read_is_a_finding_not_a_skip(self):
+        """A present-but-unreadable path was `continue`d, so the gate reported clean for content it
+        had never seen. It is refused instead.
+
+        A directory is used as the always-available case: opening one raises IsADirectoryError, an
+        OSError that is not FileNotFoundError, for every user including root. The chmod-000 case is
+        the one a deployment actually hits, and is skipped when the test user can read anything.
+        """
+        d = tempfile.mkdtemp()
+        hits = secret_scan.scan([d])            # a directory: OSError for anyone
+        self.assertEqual(len(hits), 1, hits)
+        self.assertIn("unscanned", hits[0][2])
+
+        unreadable = os.path.join(d, "locked.py")
+        with open(unreadable, "w", encoding="utf-8") as f:
+            f.write("SEED=" + self.SEED.lower() + "\n")
+        os.chmod(unreadable, 0o000)
+        try:
+            if os.access(unreadable, os.R_OK):
+                self.skipTest("the directory case passed; this user can read a chmod-000 file")
+            hits = secret_scan.scan([unreadable])
+            self.assertEqual(len(hits), 1, hits)
+            self.assertIn("unscanned", hits[0][2])
+            self.assertNotIn(self.SEED.lower(), str(hits))   # and never the file's contents
+        finally:
+            os.chmod(unreadable, 0o600)
+
+    def test_a_missing_file_is_not_a_finding(self):
+        """Tracked but deleted from the working tree carries nothing to publish, so refusing it would
+        turn the gate off within the week."""
+        self.assertEqual(secret_scan.scan([os.path.join(tempfile.mkdtemp(), "gone.py")]), [])
+
+    def test_no_listing_is_refused_rather_than_read_as_clean(self):
+        """`tracked()` ignored git's exit code and returned []. Outside a checkout, or with git
+        failing for any reason, that read as 'nothing to scan' and let the push through."""
+        d = tempfile.mkdtemp()          # not a git repository
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            with self.assertRaises(secret_scan.ScanFailed):
+                secret_scan.tracked()
+        finally:
+            os.chdir(cwd)
 
 
 if __name__ == "__main__":
