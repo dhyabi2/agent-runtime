@@ -108,7 +108,6 @@ function applyResult(index) {
   status.textContent = iconFor(result.status);
 
   updateCounters();
-  updateVerdict();
   narration.textContent = `${SCENARIOS[index].label}: ${result.note}`;
 }
 
@@ -144,6 +143,8 @@ async function runOneStep() {
   const index = pointer;
   updateVerdict();
   const card = document.getElementById(`card-${index}`);
+  const availableTravel = Math.max(0, lane.clientWidth - card.clientWidth - 20);
+  card.style.setProperty("--travel", `${availableTravel}px`);
   card.classList.add("moving");
   await new Promise((resolve) => setTimeout(resolve, 820));
   if (localToken !== runToken) {
@@ -151,8 +152,8 @@ async function runOneStep() {
     setModeDisabled(false);
     return;
   }
-  applyResult(index);
   pointer = index + 1;
+  applyResult(index);
   updateVerdict();
   running = false;
   setModeDisabled(false);
