@@ -121,7 +121,7 @@ button:hover, button:focus-visible { background: #2b437f; }
   gap: 0.5rem;
   align-items: center;
 }
-.card.moving { transform: translateX(62%); }
+.card.moving { transform: translateX(var(--travel, 0px)); }
 .card .meta { color: var(--muted); font-size: 0.85rem; }
 .card[data-status="checked"] { border-color: #2dab70; }
 .card[data-status="skipped"] { border-color: #d69a3a; }
