@@ -26,11 +26,11 @@ The demo explains, in plain language, the behavior change from:
 
 You can run it with zero dependencies:
 
-- Open `/home/runner/work/agent-runtime/agent-runtime/index.html` directly in a browser, or
+- Open `index.html` from your local repository checkout directly in a browser, or
 - Serve the repository root as static files, for example:
 
 ```bash
-cd /home/runner/work/agent-runtime/agent-runtime
+cd /path/to/agent-runtime
 python3 -m http.server 8000
 ```
 
