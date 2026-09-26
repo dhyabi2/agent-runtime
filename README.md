@@ -9,6 +9,48 @@ outward act itself and keeps the proof the world returned.
 
 This is the code that actually runs, not a cleaned-up version of it. Diff it against production.
 
+## Browser demo: secret scan security gate
+
+This repository now includes a browser-only live demo game at the site entry page:
+
+- `index.html`
+- `assets/css/style.css`
+- `assets/js/app.js`
+
+The demo explains, in plain language, the behavior change from:
+
+- **OLD GATE**: can report clean even when files were skipped or scan setup failed.
+- **NEW GATE**: fails closed (blocks or reports scan failed) when scanning is incomplete or unavailable.
+
+### Run locally
+
+You can run it with zero dependencies. The recommended path is serving the repository over HTTP:
+
+```bash
+cd /path/to/agent-runtime
+python3 -m http.server 8000
+```
+
+Then open `http://localhost:8000/`.
+
+Opening `index.html` directly also works in most modern browsers for this demo, but HTTP serving is the
+most consistent option for presentation environments.
+
+### GitHub Pages setup
+
+The landing page is repository root `index.html`, so GitHub Pages can publish directly from branch root:
+
+1. Go to **Settings → Pages**
+2. Under **Build and deployment**, choose **Deploy from a branch**
+3. Select your default branch (for example `main`) and folder **`/(root)`**
+4. Save, then open the published site URL shown on the same page
+
+### Customizing demo behavior/text
+
+- Scenario definitions and deterministic OLD/NEW outcomes: `assets/js/app.js` (`SCENARIOS`)
+- Narration copy and verdict labels: `assets/js/app.js`
+- Layout, colors, responsive behavior: `assets/css/style.css`
+
 ## Measured
 
 On a 2 GB / 1 vCPU box, with one agent working:

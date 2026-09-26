@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Security Gate Demo</title>
+  <link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+  <main class="app" aria-labelledby="page-title">
+    <header class="panel">
+      <h1 id="page-title">Security Gate Live Demo</h1>
+      <p class="subtitle">A plain-language game showing why the <strong>new secret scan gate fails closed</strong>.</p>
+      <div class="controls" role="group" aria-label="Demo controls">
+        <fieldset>
+          <legend>Gate mode</legend>
+          <label><input type="radio" name="mode" value="old" checked> OLD GATE</label>
+          <label><input type="radio" name="mode" value="new"> NEW GATE</label>
+        </fieldset>
+        <button id="runBtn" type="button">Run Demo</button>
+        <button id="stepBtn" type="button">Next Step</button>
+        <button id="resetBtn" type="button">Reset</button>
+      </div>
+    </header>
+
+    <section class="status-grid">
+      <article class="panel verdict" id="verdictPanel" data-state="idle">
+        <h2>Gate Verdict</h2>
+        <p id="verdictText" aria-live="polite">Ready to run.</p>
+      </article>
+      <article class="panel counters">
+        <h2>Live counters</h2>
+        <ul>
+          <li><span>Files found</span><strong id="filesFound">0</strong></li>
+          <li><span>Files scanned</span><strong id="filesScanned">0</strong></li>
+          <li><span>Skipped/unreadable</span><strong id="filesSkipped">0</strong></li>
+          <li><span>Findings</span><strong id="findings">0</strong></li>
+          <li><span>Exit code</span><strong id="exitCode">0</strong></li>
+        </ul>
+      </article>
+    </section>
+
+    <section class="panel narration">
+      <h2>What is happening?</h2>
+      <p id="narration" aria-live="polite">Press <strong>Run Demo</strong> to watch all four scenarios reach the publish gate.</p>
+    </section>
+
+    <section class="panel arena" aria-label="Scenario lane">
+      <h2>Scenario cards</h2>
+      <div id="lane" class="lane" role="list"></div>
+      <div class="gate" aria-hidden="true">PUBLISH GATE</div>
+    </section>
+
+    <section class="panel model" aria-label="Behavior model">
+      <h2>Deterministic behavior model</h2>
+      <p><strong>OLD GATE:</strong> can report clean even when files were skipped or file listing failed.</p>
+      <p><strong>NEW GATE:</strong> blocks when a secret is found or a file is unscannable, and returns <code>SCAN FAILED</code> when file listing is unavailable.</p>
+    </section>
+  </main>
+
+  <script src="assets/js/app.js"></script>
+</body>
+</html>
