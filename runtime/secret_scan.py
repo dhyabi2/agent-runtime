@@ -20,12 +20,24 @@ PATTERNS = [
 ALLOW = re.compile(r"(?:EXAMPLE|PLACEHOLDER|<[a-z-]+>|xxx+|0{16,}|test[_-]?fixture)", re.I)
 
 
+class ScanFailed(RuntimeError):
+    """The scan could not be performed. Never silently equivalent to 'nothing found'."""
+
+
 def scan(paths):
     findings = []
     for path in paths:
         try:
-            text = open(path, encoding="utf-8", errors="replace").read()
-        except OSError:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except FileNotFoundError:
+            # Tracked but absent from the working tree (a deletion not yet committed). There is no
+            # content here to publish, so this is not a finding.
+            continue
+        except OSError as exc:
+            # The file is there and could not be read. Reporting clean for it would be the gate
+            # lying, so it is refused instead: this hook exists because nobody is watching at 3am.
+            findings.append((path, 0, f"unreadable, so unscanned ({type(exc).__name__})"))
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
             if ALLOW.search(line):
@@ -38,12 +50,27 @@ def scan(paths):
 
 
 def tracked():
-    out = subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout
-    return [p for p in out.splitlines() if p.strip()]
+    r"""Every tracked path, exactly as it is on disk.
+
+    `-z` is not a detail. Without it `git ls-files` applies core.quotePath, so a path holding any
+    non-ASCII byte comes back quoted and octal-escaped -- `caf\303\251.py`, quotes included -- which
+    open() cannot find. The old code swallowed that as an OSError and the gate reported clean.
+    NUL-separated output is never quoted and never escaped.
+    """
+    r = subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True)
+    if r.returncode != 0:
+        # No listing means no scan. Returning [] read as "clean" and let every push through.
+        raise ScanFailed(f"git ls-files failed ({r.returncode}): {r.stderr.strip()[:200]}")
+    return [p for p in r.stdout.split("\0") if p.strip()]
 
 
 if __name__ == "__main__":
-    hits = scan(sys.argv[1:] or tracked())
+    try:
+        hits = scan(sys.argv[1:] or tracked())
+    except ScanFailed as exc:
+        print(f"refusing to push: the secret scan could not run ({exc}). Nothing was published.",
+              file=sys.stderr)
+        sys.exit(2)
     for path, lineno, name in hits:
         print(f"SECRET? {path}:{lineno} looks like a {name}", file=sys.stderr)
     if hits:
