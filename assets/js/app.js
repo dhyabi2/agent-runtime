@@ -43,6 +43,7 @@ const counters = {
 let mode = "old";
 let pointer = 0;
 let running = false;
+let runToken = 0;
 const totals = { found: 0, scanned: 0, skipped: 0, findings: 0, exitCode: 0 };
 
 function renderCards() {
@@ -73,6 +74,11 @@ function iconFor(status) {
 }
 
 function updateVerdict() {
+  if (pointer < SCENARIOS.length) {
+    verdictPanel.dataset.state = "idle";
+    verdictText.textContent = pointer === 0 ? "Ready to run." : "SCANNING...";
+    return;
+  }
   if (totals.exitCode === 2) {
     verdictPanel.dataset.state = "failed";
     verdictText.textContent = "SCAN FAILED (fails closed)";
@@ -106,7 +112,14 @@ function applyResult(index) {
   narration.textContent = `${SCENARIOS[index].label}: ${result.note}`;
 }
 
+function setModeDisabled(disabled) {
+  document.querySelectorAll('input[name="mode"]').forEach((input) => {
+    input.disabled = disabled;
+  });
+}
+
 function resetState() {
+  runToken += 1;
   pointer = 0;
   running = false;
   totals.found = 0;
@@ -114,34 +127,47 @@ function resetState() {
   totals.skipped = 0;
   totals.findings = 0;
   totals.exitCode = 0;
-  verdictPanel.dataset.state = "idle";
-  verdictText.textContent = "Ready to run.";
   narration.textContent = mode === "old"
     ? "OLD GATE mode: this can show green even when some files were not scanned."
     : "NEW GATE mode: blocks or fails whenever scanning is incomplete.";
+  setModeDisabled(false);
   updateCounters();
+  updateVerdict();
   renderCards();
 }
 
 async function runOneStep() {
   if (running || pointer >= SCENARIOS.length) return;
   running = true;
-  const card = document.getElementById(`card-${pointer}`);
+  setModeDisabled(true);
+  const localToken = runToken;
+  const index = pointer;
+  updateVerdict();
+  const card = document.getElementById(`card-${index}`);
   card.classList.add("moving");
   await new Promise((resolve) => setTimeout(resolve, 820));
-  applyResult(pointer);
-  pointer += 1;
+  if (localToken !== runToken) {
+    running = false;
+    setModeDisabled(false);
+    return;
+  }
+  applyResult(index);
+  pointer = index + 1;
+  updateVerdict();
   running = false;
+  setModeDisabled(false);
 }
 
 async function runAll() {
-  while (pointer < SCENARIOS.length) {
+  const localToken = runToken;
+  while (pointer < SCENARIOS.length && localToken === runToken) {
     await runOneStep();
   }
 }
 
 document.querySelectorAll('input[name="mode"]').forEach((input) => {
   input.addEventListener("change", (event) => {
+    if (running) return;
     mode = event.target.value;
     resetState();
   });
