@@ -190,11 +190,41 @@ the owner's personal account and is a fallback only, for when the swarm account 
 # is passed through untouched.
 MISSION_FILE = os.environ.get("AGENT_MISSION_FILE", str(HOME / "MISSION.md"))
 
+# The four the template may use. Named once, so render_mission and the laws cannot drift.
+MISSION_FIELDS = ("name", "lane", "home", "state")
+
+
+def render_mission(template, **values):
+    """Fill the four placeholders, and leave every other brace exactly as it was found.
+
+    NOT str.format. The mission is a file an operator writes, and `.format()` reads every brace in
+    it as a field of its own, so an ordinary mission killed the turn before a single model call:
+
+        {"url": "x", "pays_in": "USDC"}   KeyError: '"url"'
+        ${HOME}                           KeyError: 'HOME'
+        jq '{sha: .sha}'                  KeyError: 'sha'
+        fill in {} yourself               IndexError: Replacement index 0 out of range
+
+    It raised at the format call in `turn()`, which is after the `run`/`start` event is journalled
+    and before `ask()`, so the whole failure was a turn that started and never ended - the shape
+    this swarm has already paid to diagnose twice. A plain replacement of the four named fields
+    cannot raise, and is what the comment above has always promised.
+
+    One pass, so a value that happens to contain a brace of its own is never substituted into
+    again. There is no `{{` escape: `.format()` needed one because it read every brace, and this
+    reads four. `{{name}}` therefore renders as `{<name>}`, where it used to render as the literal
+    `{name}`; neither DEFAULT_MISSION nor the README's example mission uses that form.
+    """
+    return re.sub("|".join(re.escape("{" + k + "}") for k in MISSION_FIELDS),
+                  lambda m: str(values[m.group(0)[1:-1]]), template)
+
 
 def mission_template():
     """The mission text, from the file if there is one, else the built-in default."""
     try:
-        text = pathlib.Path(MISSION_FILE).read_text(encoding="utf-8").strip()
+        # errors="replace", not strict: UnicodeDecodeError is a ValueError, so an undecodable
+        # mission file used to escape the OSError below and take the turn down the same way.
+        text = pathlib.Path(MISSION_FILE).read_text(encoding="utf-8", errors="replace").strip()
         return text or DEFAULT_MISSION
     except OSError:
         return DEFAULT_MISSION
@@ -210,7 +240,8 @@ def turn():
     emit("run", {"lane": lane, "status": "start"})
     emit("status", {"text": f"{NAME}: starting a {lane} turn", "lane": lane})
 
-    msgs = [{"role": "user", "content": mission_template().format(name=NAME, lane=lane, home=HOME, state=read_state())}]
+    msgs = [{"role": "user", "content": render_mission(mission_template(), name=NAME, lane=lane,
+                                                      home=HOME, state=read_state())}]
     tools_used, done_note = 0, None
 
     for _ in range(MAX_TOOLS):

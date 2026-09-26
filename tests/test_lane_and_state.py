@@ -100,3 +100,61 @@ class ModeldFailureIsRetryable(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TheMissionFileIsConfigurationNotAFormatString(unittest.TestCase):
+    """The mission is the one thing a new project is meant to change (README: `AGENT_MISSION_FILE`).
+
+    `str.format` reads every brace in that file as a field of its own, so an ordinary mission —
+    a JSON example, a shell variable, a jq filter — raised inside `turn()` after the run/start
+    event was journalled and before any model call. Every turn died, and the only trace was a
+    turn that started and never ended.
+    """
+
+    FILLED = dict(name="a01", lane="work", home="/srv/swarm/a01", state="(no memory yet)")
+
+    def test_a_brace_the_operator_did_not_mean_as_a_field_is_left_alone(self):
+        for label, body in [
+            ("a JSON example", 'Record it as {"url": "https://x", "pays_in": "USDC"}.'),
+            ("a shell variable", "Your workspace is ${HOME}."),
+            ("a jq filter", "Run: jq '{sha: .sha}' out.json"),
+            ("an empty brace", "Fill in {} yourself."),
+        ]:
+            with self.subTest(label):
+                out = agent.render_mission("You are {name}. " + body + "\n{state}", **self.FILLED)
+                self.assertIn(body, out, f"{label} was altered or dropped")
+                self.assertTrue(out.startswith("You are a01. "), "the real field was not filled")
+                self.assertTrue(out.endswith("(no memory yet)"), "the real field was not filled")
+
+    def test_a_value_is_never_substituted_into_a_second_time(self):
+        """One pass. A field's value carrying another field's name must survive as text."""
+        out = agent.render_mission("{name} then {state}", **dict(self.FILLED, name="{state}"))
+        self.assertEqual(out, "{state} then (no memory yet)")
+
+    def test_every_documented_field_is_filled_and_none_is_left_behind(self):
+        template = "\n".join("{" + k + "}" for k in agent.MISSION_FIELDS)
+        out = agent.render_mission(template, **self.FILLED)
+        self.assertEqual(out.splitlines(), [self.FILLED[k] for k in agent.MISSION_FIELDS])
+        for k in agent.MISSION_FIELDS:
+            self.assertNotIn("{" + k + "}", out)
+
+    def test_the_shipped_default_mission_still_renders(self):
+        out = agent.render_mission(agent.DEFAULT_MISSION, **self.FILLED)
+        self.assertIn("a01", out)
+        self.assertIn("(no memory yet)", out)
+        for k in agent.MISSION_FIELDS:
+            self.assertNotIn("{" + k + "}", out)
+
+    def test_a_mission_file_that_is_not_utf8_does_not_take_the_turn_down(self):
+        """UnicodeDecodeError is a ValueError, so it escaped the OSError guard in mission_template."""
+        path = tempfile.mktemp(suffix=".md")
+        with open(path, "wb") as f:
+            f.write(b"You are {name}. Pay the caf\xe9 bot.\n{state}\n")
+        old = agent.MISSION_FILE
+        agent.MISSION_FILE = path
+        try:
+            out = agent.render_mission(agent.mission_template(), **self.FILLED)
+        finally:
+            agent.MISSION_FILE = old
+        self.assertIn("You are a01.", out)
+        self.assertIn("(no memory yet)", out)
