@@ -162,8 +162,14 @@ def commit_proof(repo_dir, sha=None):
     r = subprocess.run(["git", "show", "--stat", "--format=%H%n%an%n%s", sha],
                        cwd=repo_dir, capture_output=True, text=True, timeout=30)
     lines = r.stdout.splitlines()
-    files = subprocess.run(["git", "show", "--name-only", "--format=", sha], cwd=repo_dir,
-                           capture_output=True, text=True, timeout=30).stdout.split()
+    # -z, and split on NUL rather than on whitespace. Without it git applies core.quotePath, so a
+    # path holding a non-ASCII byte arrives quoted and octal-escaped ("caf\303\251.py"), and a path
+    # holding a space arrives as two entries. Either way the proof names files the commit does not
+    # contain, which is the one thing a proof log must not do. surrogateescape because a filename is
+    # bytes: an undecodable one must round-trip, not raise inside a proof builder.
+    files = [f for f in subprocess.run(
+        ["git", "show", "--name-only", "--format=", "-z", sha], cwd=repo_dir, capture_output=True,
+        text=True, errors="surrogateescape", timeout=30).stdout.split("\0") if f]
     return {"sha": lines[0] if lines else "", "subject": lines[2] if len(lines) > 2 else "",
             "files": files, "exists": r.returncode == 0}
 

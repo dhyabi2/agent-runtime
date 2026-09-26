@@ -122,6 +122,30 @@ class TheProofComesFromTheWorld(unittest.TestCase):
         self.assertEqual(p["subject"], "first")
         self.assertIn("a.txt", p["files"])
 
+    def test_a_commit_proof_names_the_files_the_commit_actually_holds(self):
+        """A proof log that names a file the commit does not contain is not a proof.
+
+        `git show --name-only` is not a list of paths: under core.quotePath a path holding a
+        non-ASCII byte comes back quoted and octal-escaped, and splitting the output on whitespace
+        turns a path holding a space into two. Both shapes were recorded as fact.
+        """
+        d = a_repo()
+        run = lambda *c: subprocess.run(c, cwd=d, capture_output=True, text=True)
+        written = ["src/my notes.py", "caf\u00e9.py", "plain.py"]
+        os.mkdir(os.path.join(d, "src"))
+        for name in written:
+            with open(os.path.join(d, name), "w") as f:
+                f.write("x\n")
+        run("git", "add", "-A")
+        run("git", "commit", "-qm", "paths a list cannot survive")
+        files = R.commit_proof(d)["files"]
+        # every recorded path is a path that is really in the commit, and none is lost.
+        # a.txt is not expected: it belongs to the first commit, and this proof is of HEAD.
+        self.assertEqual(sorted(files), sorted(written))
+        for name in files:
+            self.assertTrue(os.path.exists(os.path.join(d, name)),
+                            f"the proof names {name!r}, which is not in the tree")
+
     def test_an_unpushed_branch_is_not_in_sync_however_it_is_described(self):
         """`git push` exiting 0 is not proof; the remote's SHA is."""
         d = a_repo()
