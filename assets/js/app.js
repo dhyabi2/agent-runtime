@@ -54,7 +54,21 @@ function renderCards() {
     card.className = "card";
     card.id = `card-${index}`;
     card.setAttribute("role", "listitem");
-    card.innerHTML = `<div><strong>${scenario.label}</strong><div class="meta">${scenario.detail}</div></div><div class="meta" id="status-${index}">⏳ waiting</div>`;
+
+    const left = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = scenario.label;
+    const detail = document.createElement("div");
+    detail.className = "meta";
+    detail.textContent = scenario.detail;
+    left.append(title, detail);
+
+    const status = document.createElement("div");
+    status.className = "meta";
+    status.id = `status-${index}`;
+    status.textContent = "⏳ waiting";
+
+    card.append(left, status);
     lane.appendChild(card);
   });
 }
@@ -182,7 +196,7 @@ async function runAll() {
 
 document.querySelectorAll('input[name="mode"]').forEach((input) => {
   input.addEventListener("change", (event) => {
-    if (running) return;
+    if (running || autoRunning) return;
     mode = event.currentTarget.value;
     resetState();
   });
