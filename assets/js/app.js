@@ -43,6 +43,7 @@ const counters = {
 let mode = "old";
 let pointer = 0;
 let running = false;
+let autoRunning = false;
 let runToken = 0;
 const totals = { found: 0, scanned: 0, skipped: 0, findings: 0, exitCode: 0 };
 
@@ -117,10 +118,15 @@ function setModeDisabled(disabled) {
   });
 }
 
+function syncModeDisabled() {
+  setModeDisabled(running || autoRunning);
+}
+
 function resetState() {
   runToken += 1;
   pointer = 0;
   running = false;
+  autoRunning = false;
   totals.found = 0;
   totals.scanned = 0;
   totals.skipped = 0;
@@ -129,7 +135,7 @@ function resetState() {
   narration.textContent = mode === "old"
     ? "OLD GATE mode: this can show green even when some files were not scanned."
     : "NEW GATE mode: blocks or fails whenever scanning is incomplete.";
-  setModeDisabled(false);
+  syncModeDisabled();
   updateCounters();
   updateVerdict();
   renderCards();
@@ -138,7 +144,7 @@ function resetState() {
 async function runOneStep() {
   if (running || pointer >= SCENARIOS.length) return;
   running = true;
-  setModeDisabled(true);
+  syncModeDisabled();
   const localToken = runToken;
   const index = pointer;
   updateVerdict();
@@ -149,27 +155,35 @@ async function runOneStep() {
   await new Promise((resolve) => setTimeout(resolve, 820));
   if (localToken !== runToken) {
     running = false;
-    setModeDisabled(false);
+    syncModeDisabled();
     return;
   }
   pointer = index + 1;
   applyResult(index);
   updateVerdict();
   running = false;
-  setModeDisabled(false);
+  syncModeDisabled();
 }
 
 async function runAll() {
+  if (autoRunning) return;
+  autoRunning = true;
+  syncModeDisabled();
   const localToken = runToken;
-  while (pointer < SCENARIOS.length && localToken === runToken) {
-    await runOneStep();
+  try {
+    while (pointer < SCENARIOS.length && localToken === runToken) {
+      await runOneStep();
+    }
+  } finally {
+    autoRunning = false;
+    syncModeDisabled();
   }
 }
 
 document.querySelectorAll('input[name="mode"]').forEach((input) => {
   input.addEventListener("change", (event) => {
     if (running) return;
-    mode = event.target.value;
+    mode = event.currentTarget.value;
     resetState();
   });
 });
