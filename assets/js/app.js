@@ -32,6 +32,7 @@ const verdictText = document.getElementById("verdictText");
 const runBtn = document.getElementById("runBtn");
 const stepBtn = document.getElementById("stepBtn");
 const resetBtn = document.getElementById("resetBtn");
+const CARD_TRAVEL_PADDING = 20;
 const counters = {
   filesFound: document.getElementById("filesFound"),
   filesScanned: document.getElementById("filesScanned"),
@@ -163,7 +164,7 @@ async function runOneStep() {
   const index = pointer;
   updateVerdict();
   const card = document.getElementById(`card-${index}`);
-  const availableTravel = Math.max(0, lane.clientWidth - card.clientWidth - 20);
+  const availableTravel = Math.max(0, lane.clientWidth - card.clientWidth - CARD_TRAVEL_PADDING);
   card.style.setProperty("--travel", `${availableTravel}px`);
   card.classList.add("moving");
   await new Promise((resolve) => setTimeout(resolve, 820));
@@ -195,9 +196,9 @@ async function runAll() {
 }
 
 document.querySelectorAll('input[name="mode"]').forEach((input) => {
-  input.addEventListener("change", (event) => {
+  input.addEventListener("change", () => {
     if (running || autoRunning) return;
-    mode = event.currentTarget.value;
+    mode = input.value;
     resetState();
   });
 });

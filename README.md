@@ -24,10 +24,7 @@ The demo explains, in plain language, the behavior change from:
 
 ### Run locally
 
-You can run it with zero dependencies:
-
-- Open `index.html` from your local repository checkout directly in a browser, or
-- Serve the repository root as static files, for example:
+You can run it with zero dependencies. The recommended path is serving the repository over HTTP:
 
 ```bash
 cd /path/to/agent-runtime
@@ -35,6 +32,9 @@ python3 -m http.server 8000
 ```
 
 Then open `http://localhost:8000/`.
+
+Opening `index.html` directly also works in most modern browsers for this demo, but HTTP serving is the
+most consistent option for presentation environments.
 
 ### GitHub Pages setup
 

@@ -66,6 +66,11 @@ button:focus-visible {
   outline: 2px solid #f3d179;
   outline-offset: 2px;
 }
+button:disabled {
+  background: #1c2749;
+  color: #93a6da;
+  cursor: not-allowed;
+}
 
 .status-grid {
   display: grid;
