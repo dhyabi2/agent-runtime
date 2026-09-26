@@ -147,3 +147,12 @@ button:hover, button:focus-visible { background: #2b437f; }
   .gate { position: static; transform: none; margin-top: 0.8rem; width: 100%; }
   .card.moving { transform: translateX(0); }
 }
+
+@media (prefers-reduced-motion: reduce) {
+  .card {
+    transition: none;
+  }
+  .card.moving {
+    transform: translateX(0);
+  }
+}
