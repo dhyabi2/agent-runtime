@@ -8,19 +8,31 @@ const SCENARIOS = [
   {
     label: "café.py (non-ASCII filename with secret)",
     detail: "contains a secret pattern",
-    old: { found: 0, scanned: 0, skipped: 1, findings: 0, exitCode: 0, status: "skipped", note: "Skipped and still reported clean (false green)." },
+    old: { found: 1, scanned: 0, skipped: 1, findings: 0, exitCode: 0, status: "skipped", note: "git listed it quoted and escaped, so it could not be opened: skipped and still reported clean (false green)." },
     new: { found: 1, scanned: 1, skipped: 0, findings: 1, exitCode: 1, status: "blocked", note: "Scanned correctly and blocked." },
   },
   {
     label: "locked.py (unreadable/unscannable)",
     detail: "cannot be opened",
     old: { found: 1, scanned: 0, skipped: 1, findings: 0, exitCode: 0, status: "skipped", note: "Unreadable file was ignored and still looked clean." },
-    new: { found: 1, scanned: 0, skipped: 1, findings: 1, exitCode: 1, status: "blocked", note: "Unscannable file now blocks push." },
+    new: { found: 1, scanned: 0, skipped: 1, findings: 1, exitCode: 1, status: "blocked", note: "Present but unreadable is now a finding: push blocked." },
+  },
+  {
+    label: "notes.html (seed beside a <code> tag)",
+    detail: "a real seed on the same line as a placeholder-shaped tag",
+    old: { found: 1, scanned: 1, skipped: 0, findings: 0, exitCode: 0, status: "skipped", note: "The tag matched the allow list, which excused the whole line: the seed went out." },
+    new: { found: 1, scanned: 1, skipped: 0, findings: 1, exitCode: 1, status: "blocked", note: "A placeholder must BE the match now; the seed beside it is refused." },
+  },
+  {
+    label: "deleted.py (tracked, removed from the working tree)",
+    detail: "no working-tree content to read",
+    old: { found: 1, scanned: 0, skipped: 1, findings: 0, exitCode: 0, status: "skipped", note: "Missing file skipped in silence." },
+    new: { found: 1, scanned: 0, skipped: 1, findings: 0, exitCode: 0, status: "skipped", note: "Still allowed (nothing on disk to read), but named on stderr as NOT SCANNED." },
   },
   {
     label: "git listing failed",
     detail: "scanner cannot enumerate files",
-    old: { found: 0, scanned: 0, skipped: 0, findings: 0, exitCode: 0, status: "skipped", note: "Listing failed but old gate could still show clean." },
+    old: { found: 0, scanned: 0, skipped: 0, findings: 0, exitCode: 0, status: "skipped", note: "git ls-files failed, the list came back empty, and the old gate exited 0 having read nothing." },
     new: { found: 0, scanned: 0, skipped: 0, findings: 0, exitCode: 2, status: "failed", note: "File list unavailable: scan failed closed." },
   },
 ];
@@ -149,7 +161,7 @@ function resetState() {
   totals.exitCode = 0;
   narration.textContent = mode === "old"
     ? "OLD GATE mode: this can show green even when some files were not scanned."
-    : "NEW GATE mode: blocks or fails whenever scanning is incomplete.";
+    : "NEW GATE mode: blocks a file it cannot read, fails when it cannot list files, and names what it skipped.";
   syncModeDisabled();
   updateCounters();
   updateVerdict();
