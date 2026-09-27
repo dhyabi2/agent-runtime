@@ -17,7 +17,21 @@ PATTERNS = [
     ("private key block",     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("bearer header",         re.compile(r"Authorization:\s*Bearer\s+[A-Za-z0-9._-]{20,}")),
 ]
-ALLOW = re.compile(r"(?:EXAMPLE|PLACEHOLDER|<[a-z-]+>|xxx+|0{16,}|test[_-]?fixture)", re.I)
+# Two kinds of exemption, and the difference between them is the whole of this fix.
+#
+# An ANNOTATION is something a person writes ABOUT the line — "this value is deliberate, I have read
+# it". It says nothing about the value's shape, so a line-level exemption is the only thing it can be,
+# and it stays one: `# test-fixture: a PUBLIC key, never a seed` is the convention already in use.
+#
+# A PLACEHOLDER describes the VALUE — a redacted or invented secret. Applied to the whole line it
+# excused every real secret that merely shared a line with it, and these shapes are common enough that
+# it was not hypothetical: `xxx+` matches an `XXX` todo marker, `<[a-z-]+>` matches any bare HTML tag
+# (`<code>`, `<br>`), and `0{16,}` matches any raw XNO amount. So a placeholder must now BE the match.
+ANNOTATION = re.compile(r"(?:EXAMPLE|PLACEHOLDER|test[_-]?fixture)", re.I)
+PLACEHOLDER = re.compile(r"(?:<[a-z-]+>|xxx+|0{16,})", re.I)
+
+# Kept, and kept equal to the union of the two, because other rails import this name.
+ALLOW = re.compile(f"(?:{ANNOTATION.pattern}|{PLACEHOLDER.pattern})", re.I)
 
 
 def scan(paths):
@@ -28,10 +42,12 @@ def scan(paths):
         except OSError:
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
-            if ALLOW.search(line):
+            if ANNOTATION.search(line):
                 continue
             for name, rx in PATTERNS:
-                if rx.search(line):
+                # A finding needs one match that is not itself a placeholder. Every match is weighed,
+                # not just the first, so a real key sitting beside a redacted one is still refused.
+                if any(not PLACEHOLDER.search(m.group(0)) for m in rx.finditer(line)):
                     findings.append((path, lineno, name))   # never the matched text itself
                     break
     return findings
