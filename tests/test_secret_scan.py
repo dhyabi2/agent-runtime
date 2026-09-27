@@ -211,5 +211,92 @@ class TheGateNeverReportsCleanWithoutScanning(unittest.TestCase):
             os.chdir(cwd)
 
 
+def repo_with(files):
+    """A real git repository with ``files`` ({name: text}) added to the index.
+
+    Real, because this defect is about how git DISPLAYS a path, not about anything a fixture list of
+    strings can express: core.quotePath is what produces the unopenable path, and only git produces it.
+    """
+    d = tempfile.mkdtemp()
+    run = lambda *a: subprocess.run(a, cwd=d, check=True, capture_output=True)
+    run("git", "init", "-q", ".")
+    run("git", "config", "user.email", "law@example.com")
+    run("git", "config", "user.name", "law")
+    for name, text in files.items():
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+            f.write(text)
+    run("git", "add", "-A")
+    return d
+
+
+def gate(repo):
+    """Run the gate exactly as the pre-push hook does: as a script, in the repository."""
+    r = subprocess.run([sys.executable, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime", "secret_scan.py")],
+        cwd=repo, capture_output=True, text=True)
+    return r.returncode, r.stderr
+
+
+# Built at runtime, never written out as a literal, so this file cannot itself trip the gate.
+A_GITHUB_TOKEN = "TOKEN = \"" + "gh" + "p_" + ("AbCdEfGhIjKlMnOpQrStUvWx") + "\"\n"
+
+
+class TheGateNeverFailsOpen(unittest.TestCase):
+    """The defect: `git ls-files` without -z applies core.quotePath, so a path holding a non-ASCII
+    byte came back as `"caf\303\251.py"` -- quoted, octal-escaped, and unopenable. scan() answered an
+    unopenable path with a bare `continue`, so that file was never scanned and nothing said so: the
+    gate exited 0 on a tracked file holding a token matching its own pattern."""
+
+    def test_a_secret_in_a_non_ascii_filename_is_refused(self):
+        rc, err = gate(repo_with({"café.py": A_GITHUB_TOKEN}))
+        self.assertEqual(rc, 1, f"the gate allowed a push with a token in a non-ASCII filename:\n{err}")
+        self.assertIn("caf", err)
+
+    def test_the_same_secret_is_judged_the_same_whatever_the_filename(self):
+        """Whatever the gate decides about a token, the filename must not change that decision."""
+        verdicts = {}
+        for label, name in (("ascii", "plain.py"), ("non-ascii", "café.py"),
+                            ("with a space", "two words.py")):
+            with self.subTest(filename=label):
+                rc, _ = gate(repo_with({name: A_GITHUB_TOKEN}))
+                verdicts[label] = rc
+                self.assertEqual(rc, 1, f"a token in a {label} filename was not refused")
+        self.assertEqual(len(set(verdicts.values())), 1, f"the gate disagreed with itself: {verdicts}")
+
+    def test_tracked_returns_paths_that_open(self):
+        """The root cause, pinned directly: every path tracked() names must be openable from the
+        repository. A quoted or octal-escaped path is not."""
+        repo = repo_with({"café.py": "ok\n", "two words.py": "ok\n", "plain.py": "ok\n"})
+        cwd = os.getcwd()
+        os.chdir(repo)
+        try:
+            paths = secret_scan.tracked()
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(len(paths), 3, f"tracked() named {len(paths)} of 3 files: {paths}")
+        for p in paths:
+            with self.subTest(path=p):
+                self.assertFalse(p.startswith('"'), f"tracked() returned a quoted path: {p!r}")
+                self.assertTrue(os.path.exists(os.path.join(repo, p)),
+                                f"tracked() named a path that does not exist: {p!r}")
+
+    def test_a_clean_repository_still_passes(self):
+        """The fix must not turn the gate into one that refuses everything."""
+        rc, err = gate(repo_with({"café.py": "print('hello')\n", "plain.py": "x = 1\n"}))
+        self.assertEqual(rc, 0, f"the gate refused a clean repository:\n{err}")
+
+    def test_an_unreadable_path_is_reported_and_refused_not_skipped(self):
+        """scan() must hand back what it could not read, and the gate must refuse on it. A file the
+        gate cannot open is not a file without secrets, and that was the whole of the defect."""
+        unreadable = []
+        hits = secret_scan.scan([os.path.join(tempfile.mkdtemp(), "does-not-exist.py")], unreadable)
+        self.assertEqual(hits, [])
+        self.assertEqual(len(unreadable), 1, "an unopenable path was skipped in silence")
+
+    def test_scan_still_works_without_the_unreadable_argument(self):
+        """Callers that pass only paths keep working: the argument is optional."""
+        self.assertEqual(secret_scan.scan([os.path.join(tempfile.mkdtemp(), "nope.py")]), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

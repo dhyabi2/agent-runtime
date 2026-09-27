@@ -38,19 +38,34 @@ class ScanFailed(RuntimeError):
     """The scan could not be performed. Never silently equivalent to 'nothing found'."""
 
 
-def scan(paths):
+def scan(paths, unreadable=None):
+    """Findings for ``paths``. Every path that could not be read is also appended to ``unreadable``.
+
+    A file this gate cannot open is NOT a file without secrets. It used to be treated as one -- a bare
+    `continue` said nothing -- so a path that failed to open dropped out of the scan and the push went
+    ahead. Now:
+
+    - present but unreadable (a permission error, a directory): a FINDING, so the push is refused;
+    - missing from the working tree (a tracked file deleted but not yet committed): not a finding,
+      because there is no working-tree content to read, but still named in ``unreadable`` so the
+      caller can say out loud that it was not scanned. It is never silent.
+
+    Callers that pass only paths are unaffected.
+    """
     findings = []
     for path in paths:
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 text = f.read()
         except FileNotFoundError:
-            # Tracked but absent from the working tree (a deletion not yet committed). There is no
-            # content here to publish, so this is not a finding.
+            if unreadable is not None:
+                unreadable.append(path)
             continue
         except OSError as exc:
             # The file is there and could not be read. Reporting clean for it would be the gate
             # lying, so it is refused instead: this hook exists because nobody is watching at 3am.
+            if unreadable is not None:
+                unreadable.append(path)
             findings.append((path, 0, f"unreadable, so unscanned ({type(exc).__name__})"))
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
@@ -66,14 +81,21 @@ def scan(paths):
 
 
 def tracked():
-    r"""Every tracked path, exactly as it is on disk.
+    r"""Every tracked path, as bytes on disk rather than as git chooses to display them.
 
-    `-z` is not a detail. Without it `git ls-files` applies core.quotePath, so a path holding any
-    non-ASCII byte comes back quoted and octal-escaped -- `caf\303\251.py`, quotes included -- which
-    open() cannot find. The old code swallowed that as an OSError and the gate reported clean.
-    NUL-separated output is never quoted and never escaped.
+    `-z`, and split on NUL. Without it git applies core.quotePath, which is ON by default: a path
+    holding any non-ASCII byte comes back QUOTED and octal-escaped -- `"caf\303\251.py"`, literal
+    double quotes included -- which open() cannot find. The old code swallowed that as an OSError and
+    the gate reported clean. NUL-separated output is never quoted and never escaped.
+
+    splitlines() was a second route to the same place: it breaks on \v, \f, \x1c-\x1e, \x85, U+2028
+    and U+2029, none of which git uses to separate records under -z.
+
+    surrogateescape because a filename is bytes: an undecodable one must round-trip to something
+    open() can use, not raise inside the gate. This is the same fix receipts.commit_proof carries.
     """
-    r = subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True)
+    r = subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True,
+                       errors="surrogateescape")
     if r.returncode != 0:
         # No listing means no scan. Returning [] read as "clean" and let every push through.
         raise ScanFailed(f"git ls-files failed ({r.returncode}): {r.stderr.strip()[:200]}")
@@ -81,14 +103,20 @@ def tracked():
 
 
 if __name__ == "__main__":
+    unreadable = []
     try:
-        hits = scan(sys.argv[1:] or tracked())
+        hits = scan(sys.argv[1:] or tracked(), unreadable)
     except ScanFailed as exc:
         print(f"refusing to push: the secret scan could not run ({exc}). Nothing was published.",
               file=sys.stderr)
         sys.exit(2)
     for path, lineno, name in hits:
         print(f"SECRET? {path}:{lineno} looks like a {name}", file=sys.stderr)
+    refused = {path for path, _, _ in hits}
+    for path in unreadable:
+        if path not in refused:
+            # Missing from the working tree. Not refused, but never silent either.
+            print(f"NOT SCANNED {path}: not in the working tree", file=sys.stderr)
     if hits:
         print(f"refusing to push: {len(hits)} finding(s). Nothing was published.", file=sys.stderr)
     sys.exit(1 if hits else 0)
