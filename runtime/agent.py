@@ -301,7 +301,15 @@ def record_commits():
         "SELECT json_extract(data,'$.sha') FROM events WHERE kind='commit' AND ts > ?",
         (time.time() - 7200,)).fetchall()}
     rows = []
-    for line in out.splitlines():
+    # split("\n"), never splitlines(). git ends each --format record with a newline and nothing else,
+    # but str.splitlines() also breaks on \v, \f, \x1c-\x1e, \x85, U+2028 and U+2029. A commit
+    # subject holding one of those - and the agent writes its own subjects - was cut in two, and the
+    # tail had no \x1f in it, so `line.split("\x1f", 2)` raised ValueError. That raise landed in
+    # record_commits(), which turn() calls unguarded AFTER emitting run/ok: the turn exited non-zero
+    # on work that had succeeded, this batch of commit facts was dropped, and the push receipt and
+    # push fact below were never written at all. %H and %ct cannot contain \x1f or a newline and git
+    # folds newlines out of %s, so on a real record this unpack is total.
+    for line in out.split("\n"):
         if not line.strip():
             continue
         sha, cts, subject = line.split("\x1f", 2)
