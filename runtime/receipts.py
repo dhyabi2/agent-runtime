@@ -161,7 +161,13 @@ def commit_proof(repo_dir, sha=None):
                                 capture_output=True, text=True, timeout=30).stdout.strip()
     r = subprocess.run(["git", "show", "--stat", "--format=%H%n%an%n%s", sha],
                        cwd=repo_dir, capture_output=True, text=True, timeout=30)
-    lines = r.stdout.splitlines()
+    # split("\n"), not splitlines(): an author name is caller data and git does not end a
+    # record with every character Python does. A name holding \v, \f, \x85, U+2028 or U+2029 is
+    # accepted by git and split by splitlines(), so every later line shifts and the subject read
+    # below becomes the tail of the author's own name - a proof naming what the commit does not
+    # say. \n itself cannot appear here: git strips it from an ident. Same lesson as
+    # record_commits (tests/test_record_commits.py), which learned it first.
+    lines = r.stdout.split("\n")
     # -z, and split on NUL rather than on whitespace. Without it git applies core.quotePath, so a
     # path holding a non-ASCII byte arrives quoted and octal-escaped ("caf\303\251.py"), and a path
     # holding a space arrives as two entries. Either way the proof names files the commit does not

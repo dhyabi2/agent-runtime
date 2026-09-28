@@ -146,6 +146,38 @@ class TheProofComesFromTheWorld(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(d, name)),
                             f"the proof names {name!r}, which is not in the tree")
 
+    def test_a_commit_proof_reports_the_subject_the_commit_really_has(self):
+        """A proof log that names a subject the commit does not have is not a proof.
+
+        `commit_proof` reads `git show --format=%H%n%an%n%s` and takes the subject as
+        `splitlines()[2]`. An AUTHOR NAME is caller data, and git does not treat every
+        character Python does as a line break: a name holding a vertical tab, a form feed,
+        U+0085, U+2028 or U+2029 is accepted by git and split by `splitlines()`, so every
+        later line shifts and `subject` becomes the tail of the author's own name.
+
+        This is the lesson `tests/test_record_commits.py` already pins for
+        `record_commits`; it never reached this function. `\n` itself is not in the set
+        because git strips it from an ident, which is why splitting on `\n` alone is
+        enough.
+        """
+        for name, ch in {"vertical tab": chr(0x0B), "form feed": chr(0x0C),
+                         "next line": chr(0x85), "line separator": chr(0x2028),
+                         "paragraph separator": chr(0x2029)}.items():
+            with self.subTest(character=name):
+                d = tempfile.mkdtemp()
+                run = lambda *c, **kw: subprocess.run(c, cwd=d, capture_output=True,
+                                                      text=True, **kw)
+                run("git", "init", "-q", "-b", "main")
+                run("git", "config", "user.email", "t@t")
+                run("git", "config", "user.name", "Ada" + ch + "Lovelace")
+                with open(os.path.join(d, "a.txt"), "w") as f:
+                    f.write("one\n")
+                run("git", "add", "-A")
+                run("git", "commit", "-qm", "the real subject")
+                self.assertEqual(
+                    R.commit_proof(d)["subject"], "the real subject",
+                    f"an author name holding a {name} moved the subject line")
+
     def test_an_unpushed_branch_is_not_in_sync_however_it_is_described(self):
         """`git push` exiting 0 is not proof; the remote's SHA is."""
         d = a_repo()
