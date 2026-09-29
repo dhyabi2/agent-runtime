@@ -13,6 +13,7 @@ import ast
 import inspect
 import os
 import re
+import subprocess
 import sys
 import unittest
 
@@ -24,25 +25,48 @@ def readme():
         return f.read()
 
 
+SKIP_DIRS = (".git", "tests", "audits")
+
+
+def _python_files():
+    """The .py files that are part of this repository.
+
+    Asked of git, not of the filesystem. The README's own install makes a
+    virtualenv INSIDE the checkout (`python3 -m venv /opt/swarm/venv`, where
+    /opt/swarm is the clone), and a plain os.walk then parsed every module in
+    its site-packages -- so pip's and setuptools' vendored imports were reported
+    as this repository's undeclared dependencies. Whatever a reader leaves
+    beside the code, only what git tracks is the code.
+    """
+    done = subprocess.run(["git", "-C", ROOT, "ls-files", "-z", "*.py"],
+                          capture_output=True, text=True, check=False)
+    if done.returncode == 0:
+        return [os.path.join(ROOT, rel) for rel in done.stdout.split("\0")
+                if rel and rel.split("/")[0] not in SKIP_DIRS]
+    # Installed from a distribution rather than cloned: walk, but never descend
+    # into a virtualenv (pyvenv.cfg is at the root of every one).
+    paths = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS
+                       and not os.path.exists(os.path.join(dirpath, d, "pyvenv.cfg"))]
+        paths += [os.path.join(dirpath, n) for n in filenames if n.endswith(".py")]
+    return paths
+
+
 def third_party_imports():
     """Every module this repository imports that Python does not ship."""
     found = set()
-    for dirpath, dirnames, filenames in os.walk(ROOT):
-        dirnames[:] = [d for d in dirnames if d not in (".git", "tests", "audits")]
-        for name in filenames:
-            if not name.endswith(".py"):
+    for path in _python_files():
+        with open(path, encoding="utf-8") as f:
+            try:
+                tree = ast.parse(f.read(), path)
+            except (SyntaxError, OSError, UnicodeDecodeError):  # pragma: no cover
                 continue
-            path = os.path.join(dirpath, name)
-            with open(path, encoding="utf-8") as f:
-                try:
-                    tree = ast.parse(f.read(), path)
-                except SyntaxError:  # pragma: no cover - a parse failure is a different law's job
-                    continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    found.update(a.name.split(".")[0] for a in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                    found.add(node.module.split(".")[0])
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                found.add(node.module.split(".")[0])
     # Modules that live in this checkout are not dependencies.
     local = {"guard", "journal", "receipts", "agent", "modeld", "secret_scan", "hub", "runtime", "lib"}
     return {m for m in found if m not in local and m not in sys.stdlib_module_names}
@@ -103,6 +127,65 @@ class TheReadmeCanBeFollowed(unittest.TestCase):
         missing = sorted(r for r in roots if r not in text)
         self.assertEqual(missing, [],
                          f"the units run from {missing}, which the README's install never creates")
+
+    def test_a_virtualenv_in_the_checkout_is_not_read_as_this_repository(self):
+        """The README's install makes a virtualenv INSIDE the clone:
+
+            git clone https://github.com/dhyabi2/agent-runtime /opt/swarm
+            python3 -m venv /opt/swarm/venv
+
+        `third_party_imports` used to os.walk the checkout, so every module in
+        that venv's site-packages was parsed as this repository's code. Following
+        the README and then running the suite -- the two things a reader does
+        first -- turned the dependency law red and blamed the repository for 76
+        modules it does not import:
+
+            AssertionError: the code imports ['ConfigParser', 'Cython', ...,
+            'zope'], which the README never tells anyone to install
+
+        A reader has no way to tell that from a real missing dependency. The
+        files are now asked of git, so anything untracked beside the code is not
+        the code.
+        """
+        intruder = os.path.join(ROOT, "venv", "lib", "site-packages")
+        os.makedirs(intruder, exist_ok=True)
+        planted = os.path.join(intruder, "_planted.py")
+        try:
+            with open(planted, "w", encoding="utf-8") as f:
+                f.write("import a_module_this_repository_never_imports\n")
+            # the venv's own marker, so the non-git fallback path is exercised too
+            with open(os.path.join(ROOT, "venv", "pyvenv.cfg"), "w", encoding="utf-8") as f:
+                f.write("home = /usr/bin\n")
+            self.assertNotIn("a_module_this_repository_never_imports", third_party_imports())
+            self.assertEqual(sorted(m for m in third_party_imports() if m not in readme()), [])
+        finally:
+            for path in (planted, os.path.join(ROOT, "venv", "pyvenv.cfg")):
+                if os.path.exists(path):
+                    os.remove(path)
+            for d in (intruder, os.path.dirname(intruder), os.path.dirname(os.path.dirname(intruder))):
+                if os.path.isdir(d) and not os.listdir(d):
+                    os.rmdir(d)
+
+    def test_git_ignores_the_virtualenv_the_readme_tells_a_reader_to_make(self):
+        """The same install, one step further: `.gitignore` covered `__pycache__/`
+        and `*.pyc` and nothing else, so after
+
+            python3 -m venv /opt/swarm/venv
+            /opt/swarm/venv/bin/pip install websockets
+
+        a plain `git add -A` staged **1119 paths** of the virtualenv -- measured,
+        not supposed. check-ignore is asked about a path rather than the
+        .gitignore text, so the property held is the behaviour.
+        """
+        if not os.path.isdir(os.path.join(ROOT, ".git")):
+            self.skipTest("not a git checkout (installed from a distribution)")
+        for probe in ("venv/bin/activate", "venv/lib/python3.11/site-packages/pip/__init__.py",
+                      ".venv/bin/python"):
+            done = subprocess.run(["git", "-C", ROOT, "check-ignore", probe],
+                                  capture_output=True, text=True, check=False)
+            self.assertEqual(done.returncode, 0,
+                             f"git does not ignore {probe!r}, so the README's own install leaves a "
+                             "virtualenv where `git add -A` will commit it")
 
     def test_both_documents_name_the_columns_the_chain_does_not_cover(self):
         """`receipts.py` is the part the README tells a reader to steal, and its claim was wider than
