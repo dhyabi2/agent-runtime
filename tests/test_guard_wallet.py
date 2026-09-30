@@ -76,6 +76,67 @@ class TheSeedCannotLeave(unittest.TestCase):
                   "cp /tmp/fake.py /opt/swarm/swarm/guard.py"):
             self.assertRefused(c)
 
+    def test_one_wrapper_word_does_not_unlock_the_guard(self):
+        """The rails lock was anchored with .match(), so it only ever saw the FIRST word of a
+        fragment. `rm /opt/swarm/swarm/guard.py` was refused and every one of these was allowed:
+
+            bash -c 'rm /opt/swarm/swarm/guard.py'
+            env rm /opt/swarm/swarm/guard.py
+            timeout 5 rm /opt/swarm/swarm/guard.py
+            nohup rm /opt/swarm/swarm/guard.py
+            xargs -n1 rm /opt/swarm/swarm/guard.py
+            find /opt/swarm -path /opt/swarm/swarm/guard.py -exec rm {} +
+
+        The wallet and the env survived it only because the SECRET path already fails closed,
+        which is why `bash -c 'cat /root/.swarm/wallet.json'` was refused throughout. guard.py,
+        sshd_config and authorized_keys had nothing but this rule, so the file's own claim --
+        "an agent that can edit its own guard has no guard" -- cost one word to defeat.
+
+        Written by attacking it, like the laws above it: each case is a way in, not a paraphrase
+        of the rule.
+        """
+        G = "/opt/swarm/swarm/guard.py"
+        for c in (f"bash -c 'rm {G}'",
+                  f'sh -c "rm {G}"',
+                  f"bash -lc 'echo x >> /etc/ssh/sshd_config'",
+                  f"env rm {G}",
+                  f"env FOO=1 BAR=2 rm {G}",
+                  f"timeout 5 rm {G}",
+                  f"timeout 30s mv {G} /tmp/x",
+                  f"nohup rm {G}",
+                  f"setsid rm {G}",
+                  "nice -n 10 rm /root/.ssh/authorized_keys",
+                  f"xargs -n1 rm {G}",
+                  f"sudo -u root bash -c 'rm {G}'",
+                  f"find /opt/swarm -path {G} -exec rm {{}} +",
+                  f"find / -path '*/swarm/guard.py' -exec sed -i s/a/b/ {{}} \\;",
+                  f"command rm {G}",
+                  f"exec rm {G}",
+                  f"stdbuf -o0 tee {G}",
+                  f"bash -c 'cat {W}'"):
+            self.assertRefused(c)
+
+    def test_wrapped_reads_are_still_reads(self):
+        """Failing closed must not take the second tier with it: the agent still has to be able
+        to read the rules it is judged by, through a wrapper as well as bare."""
+        G = "/opt/swarm/swarm/guard.py"
+        for c in (f"cat {G}", f"bash -c 'cat {G}'", f"sh -c 'grep -c def {G}'",
+                  f"timeout 5 head -40 {G}", f"tail -n 20 {G}", f"less {G}",
+                  f"wc -l {G}", f"sha256sum {G}", f"ls -l {G}", f"grep -n RAILS {G}"):
+            self.assertAllowed(c)
+
+    def test_an_unrecognised_shape_on_a_rail_is_refused_not_waved_past(self):
+        """The point of turning the rule round. A blocklist of write programs will always be
+        missing one -- it was missing every wrapper -- so a shape the guard does not recognise
+        as a read is refused. A false refusal costs a retry; the other direction cost the guard.
+        """
+        G = "/opt/swarm/swarm/guard.py"
+        for c in (f"someprogram-we-never-heard-of {G}",
+                  f"./tool {G}",
+                  f"awk '{{print}}' {G}",
+                  f"xxd {G}"):
+            self.assertRefused(c)
+
     def test_ordinary_work_is_untouched(self):
         """A lock that blocks the job is not a lock, it is an outage."""
         for c in ("git commit -am 'a01: faster journal read'", "python3 -m pytest tests/",

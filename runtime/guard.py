@@ -44,20 +44,80 @@ X_POST_RE = re.compile(r"\brai-x\b|api\.(?:twitter|x)\.com|\b(?:tweet|post-newsl
 
 # The agent may rewrite its own code freely (that is the point), but not the things that keep it honest.
 RAILS_RE = re.compile(r"(?:/swarm/guard\.py|/etc/swarm/env|\.swarm/wallet\.json|sshd_config|authorized_keys)")
-# A write is not six commands. An editor is a write; so is an interpreter, a copy, a link, a patch
-# and a redirection. `vi ~/.swarm/wallet.json` was allowed until 2026-09-19 because it was not listed.
-RAILS_WRITE_RE = re.compile(
-    r"^(?:sudo\s+)?(?:rm|mv|cp|tee|truncate|chmod|chown|chattr|dd|ln|install|rsync|patch|shred|split"
-    r"|sed\s+-i|perl\s+-i|vi|vim|nvim|view|nano|pico|emacs|ed|joe|micro|code|gedit|kate"
-    r"|python3?|perl|ruby|node|php|busybox|git)\b")
+_SPLIT = re.compile(r"&&|\|\||;|\||\n")
+
+# The rails fail CLOSED, like the seed and the env below, and for the reason this file already
+# gives for them: listing the programs that may not write will always be missing one. It was
+# missing every wrapper. `rm /opt/swarm/swarm/guard.py` was refused while all of
+#
+#     bash -c 'rm /opt/swarm/swarm/guard.py'      env rm /opt/swarm/swarm/guard.py
+#     timeout 5 rm /opt/swarm/swarm/guard.py      nohup rm /opt/swarm/swarm/guard.py
+#     xargs -n1 rm /opt/swarm/swarm/guard.py      find /opt/swarm -name guard.py -exec rm {} +
+#
+# were allowed, because the old blocklist was anchored with .match() and so only ever saw the
+# FIRST word of a fragment. One wrapper word and the guard no longer guarded itself.
+#
+# So the question is turned round: a fragment naming a rail is refused unless it is recognisably
+# a READ. Reads stay possible on purpose -- an agent that cannot read its own rules cannot follow
+# them -- but only in these shapes, and anything unrecognised is refused rather than waved past.
+RAILS_READ_RE = re.compile(
+    r"^(?:cat|head|tail|less|more|nl|wc|grep|egrep|fgrep|rg|stat|ls|file|md5sum|sha256sum|sha1sum"
+    r"|cmp|diff|realpath|readlink|dirname|basename|test|\[)\b")
 RAILS_REDIRECT_RE = re.compile(
     r">>?\s*\S*(?:/swarm/guard\.py|/etc/swarm/env|\.swarm/wallet\.json|sshd_config|authorized_keys)")
+
+# Wrappers that run the next word as a command. Peeling them is best-effort and safe in this
+# direction: an unpeeled fragment is not recognised as a read and is therefore refused, so a
+# wrapper this list misses costs a false refusal, never a silent write.
+_WRAPPER_RE = re.compile(
+    r"^(?:sudo|doas|env|nohup|setsid|exec|command|builtin|time|nice|ionice|stdbuf|xargs|timeout"
+    r"|ssh|chroot)\b(?:\s+(?:-{1,2}[\w-]+|[A-Za-z_][A-Za-z0-9_]*=\S*|[\d.]+[smhd]?))*\s+")
+_DASH_C_RE = re.compile(
+    r"^(?:[bdzk]?a?sh|ash|dash|busybox\s+sh)\b(?:\s+-\w+)*\s+-c\s+(['\"]?)(?P<script>.*?)\1\s*$")
+_FIND_EXEC_RE = re.compile(r"-exec(?:dir)?\s+(?P<cmd>.+?)\s*(?:\\;|;|\+)\s*$")
+
+
+def _shapes(fragment, depth=0):
+    """`fragment` plus every command shape hidden inside it (wrappers peeled, an
+    interpreter's -c script and a find -exec body examined in their own right).
+
+    Depth-bounded so a nested quote cannot spin. Only ever used to ask whether a
+    read is in there, so missing a shape refuses rather than allows.
+    """
+    out = [fragment]
+    if depth >= 4:
+        return out
+    stripped = fragment
+    while True:
+        peeled = _WRAPPER_RE.sub("", stripped, count=1).strip()
+        if peeled == stripped or not peeled:
+            break
+        stripped = peeled
+        out.append(stripped)
+    m = _DASH_C_RE.match(stripped)
+    if m and m.group("script").strip():
+        for inner in (q.strip() for q in _SPLIT.split(m.group("script")) if q.strip()):
+            out += _shapes(inner, depth + 1)
+    m = _FIND_EXEC_RE.search(stripped)
+    if m:
+        out += _shapes(m.group("cmd").strip(), depth + 1)
+    return out
+
+
+def _is_read(fragment):
+    """True only if some shape inside `fragment` is one of the permitted reads."""
+    return any(RAILS_READ_RE.match(shape) for shape in _shapes(fragment))
 
 # The ONLY permitted shape for a command that names the seed or the env: sourcing it so the program
 # that follows inherits the variables. Everything else is refused, whatever program is asking.
 SECRET_SAFE_RE = re.compile(r"^(?:set\s+[-+]a|(?:\.|source)\s+\S*(?:env|\.env)\s*)$")
 
-_SPLIT = re.compile(r"&&|\|\||;|\||\n")
+
+
+RAILS_REFUSAL = (
+    "Blocked: that touches the rails themselves (this guard, the env, the wallet, ssh) in a shape "
+    "that is not a plain read. You may rewrite any other part of yourself freely — but not the "
+    "thing that checks you. Read them with cat/head/grep if you need to see the rules.")
 
 
 def refuse(command):
@@ -97,8 +157,13 @@ def refuse(command):
                 "one place a mistake cannot be taken back. Record the result in the journal instead — the "
                 "live map publishes it, and the swarm's other agents can post it once it is proven.")
 
-    if RAILS_RE.search(cmd) and (RAILS_REDIRECT_RE.search(cmd)
-                                 or any(RAILS_WRITE_RE.match(p) for p in parts)):
-        return ("Blocked: that edits the rails themselves (this guard, the env, the wallet, ssh). You may "
-                "rewrite any other part of yourself freely — but not the thing that checks you.")
+    if RAILS_RE.search(cmd):
+        if RAILS_REDIRECT_RE.search(cmd):
+            return RAILS_REFUSAL
+        for p in parts:
+            # `. /etc/swarm/env` names a rail and is how every tool on the box is started.
+            # The secret path above already permits exactly that shape and nothing else, so
+            # the rails path honours the same exemption rather than inventing a second one.
+            if RAILS_RE.search(p) and not (_is_read(p) or SECRET_SAFE_RE.match(p)):
+                return RAILS_REFUSAL
     return None
