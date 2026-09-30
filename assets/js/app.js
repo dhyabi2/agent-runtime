@@ -193,7 +193,12 @@ async function runOneStep() {
 }
 
 async function runAll() {
-  if (autoRunning) return;
+  // `running`, not only `autoRunning`. runOneStep returns at once while a step is still animating,
+  // so with a step in flight this loop called it, got an already-resolved promise back, and awaited
+  // that -- a microtask. The event loop drains every microtask before it runs a timer, so the step's
+  // own 820ms setTimeout could never fire, `pointer` could never advance, and the loop spun forever:
+  // clicking Step and then Run inside the animation froze the tab, permanently and every time.
+  if (autoRunning || running) return;
   autoRunning = true;
   syncModeDisabled();
   const localToken = runToken;
