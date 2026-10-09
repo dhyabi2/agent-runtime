@@ -62,51 +62,59 @@ _SPLIT = re.compile(r"&&|\|\||;|\||\n")
 # them -- but only in these shapes, and anything unrecognised is refused rather than waved past.
 RAILS_READ_RE = re.compile(
     r"^(?:cat|head|tail|less|more|nl|wc|grep|egrep|fgrep|rg|stat|ls|file|md5sum|sha256sum|sha1sum"
-    r"|cmp|diff|realpath|readlink|dirname|basename|test|\[)\b")
+    r"|cmp|diff|realpath|readlink|dirname|basename|test|\[)(?=\s|$)")
 RAILS_REDIRECT_RE = re.compile(
     r">>?\s*\S*(?:/swarm/guard\.py|/etc/swarm/env|\.swarm/wallet\.json|sshd_config|authorized_keys)")
 
-# Wrappers that run the next word as a command. Peeling them is best-effort and safe in this
-# direction: an unpeeled fragment is not recognised as a read and is therefore refused, so a
-# wrapper this list misses costs a false refusal, never a silent write.
+# Wrappers that run the next word as a command. Only the bare word, `VAR=value` assignments and a
+# bare duration/number are peeled -- never a `-option`, because an option can take the next word
+# as its argument (`env -u cat rm ...` runs rm, with `cat` as the name of a variable to unset).
+# Peeling is safe in this direction: an unpeeled fragment is not recognised as a read and is
+# therefore refused, so a wrapper or option this misses costs a false refusal, never a write.
 _WRAPPER_RE = re.compile(
     r"^(?:sudo|doas|env|nohup|setsid|exec|command|builtin|time|nice|ionice|stdbuf|xargs|timeout"
-    r"|ssh|chroot)\b(?:\s+(?:-{1,2}[\w-]+|[A-Za-z_][A-Za-z0-9_]*=\S*|[\d.]+[smhd]?))*\s+")
+    r"|ssh|chroot)(?:\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*|[\d.]+[smhd]?))*\s+")
 _DASH_C_RE = re.compile(
     r"^(?:[bdzk]?a?sh|ash|dash|busybox\s+sh)\b(?:\s+-\w+)*\s+-c\s+(['\"]?)(?P<script>.*?)\1\s*$")
-_FIND_EXEC_RE = re.compile(r"-exec(?:dir)?\s+(?P<cmd>.+?)\s*(?:\\;|;|\+)\s*$")
+# A find is a read only with none of the primaries that write or prompt, and with every -exec body
+# itself a read terminated by `+` (a `;` terminator has already been split off by _SPLIT).
+_FIND_WRITE_RE = re.compile(r"(?:^|\s)-(?:delete|fprint0?|fprintf|fls|ok|okdir)(?=\s|$)")
+_FIND_EXEC_RE = re.compile(r"\s-exec(?:dir)?(?=\s|$)")
+_FIND_EXEC_BODY_RE = re.compile(r"\s-exec(?:dir)?\s+(?P<cmd>.+?)\s+\+(?=\s|$)")
+# Shapes that run a second command inside what looks like a read: substitution, process
+# substitution, and a lone `&` (background-and-continue, which _SPLIT does not split on).
+# `2>&1` and `&>` are redirections, not a second command, and stay allowed.
+_HIDDEN_COMMAND_RE = re.compile(r"`|\$\(|[<>]\(|(?<![>&])&(?![>&])")
 
 
-def _shapes(fragment, depth=0):
-    """`fragment` plus every command shape hidden inside it (wrappers peeled, an
-    interpreter's -c script and a find -exec body examined in their own right).
+def _is_read(fragment, depth=0):
+    """True only if `fragment`, all the way down, is one of the permitted reads.
 
-    Depth-bounded so a nested quote cannot spin. Only ever used to ask whether a
-    read is in there, so missing a shape refuses rather than allows.
+    Wrappers are peeled, an interpreter's -c script must be reads in EVERY part, and a find must
+    write nothing and exec only reads. The answer is about the whole fragment, not about some
+    piece of it: `rm -- <rail> -exec cat {} +` contains a read-shaped piece and is still an rm.
+    Depth-bounded so a nested quote cannot spin; anything unrecognised is not a read.
     """
-    out = [fragment]
-    if depth >= 4:
-        return out
-    stripped = fragment
+    if depth > 4 or _HIDDEN_COMMAND_RE.search(fragment):
+        return False
+    shape = fragment.strip()
     while True:
-        peeled = _WRAPPER_RE.sub("", stripped, count=1).strip()
-        if peeled == stripped or not peeled:
+        peeled = _WRAPPER_RE.sub("", shape, count=1).strip()
+        if peeled == shape or not peeled:
             break
-        stripped = peeled
-        out.append(stripped)
-    m = _DASH_C_RE.match(stripped)
-    if m and m.group("script").strip():
-        for inner in (q.strip() for q in _SPLIT.split(m.group("script")) if q.strip()):
-            out += _shapes(inner, depth + 1)
-    m = _FIND_EXEC_RE.search(stripped)
+        shape = peeled
+    m = _DASH_C_RE.match(shape)
     if m:
-        out += _shapes(m.group("cmd").strip(), depth + 1)
-    return out
-
-
-def _is_read(fragment):
-    """True only if some shape inside `fragment` is one of the permitted reads."""
-    return any(RAILS_READ_RE.match(shape) for shape in _shapes(fragment))
+        inner = [q.strip() for q in _SPLIT.split(m.group("script")) if q.strip()]
+        return bool(inner) and all(_is_read(q, depth + 1) for q in inner)
+    if re.match(r"find(?=\s|$)", shape):
+        if _FIND_WRITE_RE.search(shape):
+            return False
+        bodies = [m.group("cmd") for m in _FIND_EXEC_BODY_RE.finditer(shape)]
+        if len(bodies) != len(_FIND_EXEC_RE.findall(shape)):
+            return False
+        return all(_is_read(b, depth + 1) for b in bodies)
+    return bool(RAILS_READ_RE.match(shape))
 
 # The ONLY permitted shape for a command that names the seed or the env: sourcing it so the program
 # that follows inherits the variables. Everything else is refused, whatever program is asking.

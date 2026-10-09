@@ -137,6 +137,30 @@ class TheSeedCannotLeave(unittest.TestCase):
                   f"xxd {G}"):
             self.assertRefused(c)
 
+    def test_a_read_shaped_piece_does_not_make_the_whole_fragment_a_read(self):
+        """Asking whether SOME shape inside a fragment was a read let a write carry one along.
+        The first two were refused on main (rm and python3 were on the old write list) and
+        became allowed when the rails were turned round; the rest were allowed on both.
+        """
+        G = "/opt/swarm/swarm/guard.py"
+        for c in (f"rm -f -- {G} -exec cat {{}} +",
+                  f"python3 -c '__import__(\"os\").remove(\"{G}\")' -exec cat {{}} +",
+                  f"env -u cat rm {G}",
+                  f"sudo -u cat rm {G}",
+                  f"find /opt/swarm -path {G} -delete -exec cat {{}} +",
+                  f"find /opt/swarm -path {G} -fprint {G}",
+                  f"find /opt/swarm -path {G} -exec rm {{}} + -exec cat {{}} +",
+                  f"cat /etc/hostname & rm {G}",
+                  f"cat <(rm {G})",
+                  f"cat $(rm {G})",
+                  f"cat `rm {G}`",
+                  f"cat-but-not-cat {G}",
+                  f"bash -c 'cat {G} & rm {G}'"):
+            self.assertRefused(c)
+        for c in (f"find /opt/swarm -path {G}", f"find /opt/swarm -path {G} -exec cat {{}} +",
+                  f"cat {G} 2>&1", f"[ -f {G} ]"):
+            self.assertAllowed(c)
+
     def test_ordinary_work_is_untouched(self):
         """A lock that blocks the job is not a lock, it is an outage."""
         for c in ("git commit -am 'a01: faster journal read'", "python3 -m pytest tests/",
