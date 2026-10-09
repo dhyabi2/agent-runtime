@@ -13,6 +13,7 @@ for anything. That makes the money lock the ONLY thing standing between a bad tu
 amounts live here in code and nowhere else — not in env, not in config, not in the prompt.
 """
 import re
+import shlex
 
 # 1 XNO = 10^30 raw. The owner funds this agent with 1 XNO and it tips 0.000001 XNO (10^24 raw).
 # Total exposure is bounded by what is in the wallet; a tip is deliberately far below anything worth stealing.
@@ -57,64 +58,226 @@ _SPLIT = re.compile(r"&&|\|\||;|\||\n")
 # were allowed, because the old blocklist was anchored with .match() and so only ever saw the
 # FIRST word of a fragment. One wrapper word and the guard no longer guarded itself.
 #
-# So the question is turned round: a fragment naming a rail is refused unless it is recognisably
-# a READ. Reads stay possible on purpose -- an agent that cannot read its own rules cannot follow
-# them -- but only in these shapes, and anything unrecognised is refused rather than waved past.
-RAILS_READ_RE = re.compile(
-    r"^(?:cat|head|tail|less|more|nl|wc|grep|egrep|fgrep|rg|stat|ls|file|md5sum|sha256sum|sha1sum"
-    r"|cmp|diff|realpath|readlink|dirname|basename|test|\[)(?=\s|$)")
+# So the question is turned round: a command naming a rail is refused unless EVERY piece of it is
+# recognisably a READ. Reads stay possible on purpose -- an agent that cannot read its own rules
+# cannot follow them -- but only in these shapes, and anything unrecognised is refused rather than
+# waved past.
+#
+# Every piece, not only the piece that names the rail: a read word is only a read if nothing earlier
+# in the same command changed what that word runs. `cat(){ rm "$1";}; cat <rail>`, `export
+# PATH=/evil; cat <rail>` and `env PATH=/evil cat <rail>` all end in a fragment that says `cat`.
+#
+# Not on the list, deliberately: `rg` (`--pre <cmd>` runs a program per file, and its config file
+# can add that flag silently), `less`/`more` (shell escapes and LESSOPEN; a pager is useless to an
+# agent without a terminal anyway). grep, head and tail do the same reads and run nothing.
+RAILS_READ_WORDS = frozenset((
+    "cat", "head", "tail", "nl", "wc", "grep", "egrep", "fgrep", "stat", "ls", "file", "md5sum",
+    "sha256sum", "sha1sum", "cmp", "diff", "realpath", "readlink", "dirname", "basename", "test", "["))
 RAILS_REDIRECT_RE = re.compile(
-    r">>?\s*\S*(?:/swarm/guard\.py|/etc/swarm/env|\.swarm/wallet\.json|sshd_config|authorized_keys)")
+    r"(?:<>|>)[>|&]*\s*\S*(?:/swarm/guard\.py|/etc/swarm/env|\.swarm/wallet\.json|sshd_config"
+    r"|authorized_keys)")
+# On a rail command the env may be sourced only from the rail itself: SECRET_SAFE_RE below accepts
+# any file whose name ends in `env`, and `. /tmp/x/env; cat <rail>` would let that file redefine cat.
+_TRUSTED_SETUP_RE = re.compile(r"^(?:set\s+[-+]a|(?:\.|source)\s+/etc/swarm/env)$")
 
-# Wrappers that run the next word as a command. Only the bare word, `VAR=value` assignments and a
-# bare duration/number are peeled -- never a `-option`, because an option can take the next word
-# as its argument (`env -u cat rm ...` runs rm, with `cat` as the name of a variable to unset).
-# Peeling is safe in this direction: an unpeeled fragment is not recognised as a read and is
-# therefore refused, so a wrapper or option this misses costs a false refusal, never a write.
-_WRAPPER_RE = re.compile(
-    r"^(?:sudo|doas|env|nohup|setsid|exec|command|builtin|time|nice|ionice|stdbuf|xargs|timeout"
-    r"|ssh|chroot)(?:\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*|[\d.]+[smhd]?))*\s+")
-_DASH_C_RE = re.compile(
-    r"^(?:[bdzk]?a?sh|ash|dash|busybox\s+sh)\b(?:\s+-\w+)*\s+-c\s+(['\"]?)(?P<script>.*?)\1\s*$")
-# A find is a read only with none of the primaries that write or prompt, and with every -exec body
-# itself a read terminated by `+` (a `;` terminator has already been split off by _SPLIT).
-_FIND_WRITE_RE = re.compile(r"(?:^|\s)-(?:delete|fprint0?|fprintf|fls|ok|okdir)(?=\s|$)")
-_FIND_EXEC_RE = re.compile(r"\s-exec(?:dir)?(?=\s|$)")
-_FIND_EXEC_BODY_RE = re.compile(r"\s-exec(?:dir)?\s+(?P<cmd>.+?)\s+\+(?=\s|$)")
+# Wrappers that run the rest of their arguments as a command, each with the ONLY options it may
+# carry: (options without a value, options that take a value). Anything else -- an unknown option,
+# `sudo -i`/`-s` (a login shell reads profiles), `env -u`, `exec -a` -- leaves the wrapper unpeeled,
+# and an unpeeled fragment is not a read, so a miss here costs a false refusal, never a write.
+_WRAPPERS = {
+    "sudo": ({"-n", "-H", "-E", "-k", "-S", "--non-interactive"}, {"-u", "-g", "--user", "--group"}),
+    "doas": ({"-n"}, {"-u"}),
+    "env": (set(), set()),
+    "nohup": (set(), set()),
+    "setsid": (set(), set()),
+    "exec": (set(), set()),
+    "command": (set(), set()),
+    "time": ({"-p"}, set()),
+    "nice": (set(), {"-n"}),
+    "ionice": ({"-t"}, {"-c", "-n"}),
+    "stdbuf": (set(), {"-i", "-o", "-e"}),
+    "timeout": ({"--foreground", "--preserve-status", "-v", "--verbose"},
+                {"-s", "-k", "--signal", "--kill-after"}),
+    "xargs": ({"-r", "-0", "-t", "--no-run-if-empty", "--null"}, {"-n", "-L", "-P"}),
+}
+# Only these may be set on the way to a read. PATH, BASH_ENV, LD_PRELOAD, RIPGREP_CONFIG_PATH and
+# every other variable that decides what a word runs are not on it.
+_SAFE_ASSIGN_RE = re.compile(r"^(?:LC_[A-Z]+|LANG|LANGUAGE|TZ|TERM|COLUMNS|LINES|NO_COLOR)=[^=]*$")
+_DURATION_RE = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+_SHELLS = frozenset(("sh", "bash", "dash"))      # zsh reads ~/.zshenv even for -c, so it is not here
+_FIND_WRITES = frozenset(("-delete", "-fprint", "-fprint0", "-fprintf", "-fls", "-ok", "-okdir"))
+_LOCAL_HOST_RE = re.compile(r"^(?:localhost|127\.|0\.0\.0\.0|::1|\[::1\])", re.I)
 # Shapes that run a second command inside what looks like a read: substitution, process
-# substitution, and a lone `&` (background-and-continue, which _SPLIT does not split on).
-# `2>&1` and `&>` are redirections, not a second command, and stay allowed.
+# substitution, and a lone `&` (background-and-continue). `2>&1` and `&>` are redirections.
 _HIDDEN_COMMAND_RE = re.compile(r"`|\$\(|[<>]\(|(?<![>&])&(?![>&])")
+_FUNCTION_DEF_RE = re.compile(r"\(\s*\)")
+_GLOB_RE = re.compile(r"[*?\[\]{}]")
+
+
+def _split_unquoted(cmd):
+    """Split a shell command on ; && || | |& and newline, but not inside quotes or after a backslash.
+
+    `grep -E 'a|b' <rail>` is one command; `find ... -exec cat {} ';'` is one command. None if a
+    quote is left open, which bash would refuse to run as written anyway.
+    """
+    parts, cur, i, q, n = [], [], 0, None, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if q == "'":
+            q = None if c == "'" else q
+            cur.append(c); i += 1; continue
+        if c == "\\" and i + 1 < n:
+            cur.append(cmd[i:i + 2]); i += 2; continue
+        if q == '"':
+            q = None if c == '"' else q
+            cur.append(c); i += 1; continue
+        if c in "'\"":
+            q = c; cur.append(c); i += 1; continue
+        if c in ";|\n" or cmd.startswith("&&", i):
+            if c == "|" and cur and cur[-1] == ">":          # `>|` is a redirection, not a pipe
+                cur.append(c); i += 1; continue
+            parts.append("".join(cur)); cur = []
+            i += 2 if cmd.startswith(("&&", "||", "|&", ";;"), i) else 1
+            continue
+        cur.append(c); i += 1
+    if q:
+        return None
+    parts.append("".join(cur))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _unquoted(fragment):
+    """(text bash will expand, text outside every quote). Single-quoted text expands nothing;
+    double-quoted text still expands `$`; only text outside all quotes globs."""
+    expands, bare, i, q, n = [], [], 0, None, len(fragment)
+    while i < n:
+        c = fragment[i]
+        if q == "'":
+            q = None if c == "'" else q
+        elif c == "\\" and i + 1 < n:
+            i += 1
+        elif q == '"':
+            q = None if c == '"' else q
+            if q:
+                expands.append(c)
+        elif c in "'\"":
+            q = c
+        else:
+            expands.append(c); bare.append(c)
+        i += 1
+    return "".join(expands), "".join(bare)
+
+
+def _peel(argv):
+    """Strip permitted wrappers off the front of argv. Returns (argv, peeled_any) or None."""
+    peeled = False
+    while argv and argv[0] in _WRAPPERS:
+        word, (flags, takes_value) = argv[0], _WRAPPERS[argv[0]]
+        rest, i = argv[1:], 0
+        while i < len(rest) and rest[i].startswith("-") and rest[i] != "-":
+            t = rest[i]
+            if t == "--":
+                i += 1; break
+            if t in flags:
+                i += 1
+            elif t in takes_value:
+                i += 2
+            elif any(t.startswith(o + "=") for o in takes_value if o.startswith("--")):
+                i += 1
+            elif any(t.startswith(o) and len(t) > 2 for o in takes_value if len(o) == 2):
+                i += 1                                    # attached value: -uroot, -n10, -oL
+            else:
+                return None
+        if word in ("env", "sudo"):
+            while i < len(rest) and "=" in rest[i] and not rest[i].startswith("-"):
+                if not _SAFE_ASSIGN_RE.match(rest[i]):
+                    return None
+                i += 1
+        if word == "timeout":
+            if i >= len(rest) or not _DURATION_RE.match(rest[i]):
+                return None
+            i += 1
+        if i > len(rest):
+            return None
+        argv, peeled = rest[i:], True
+        if word == "xargs":                       # xargs appends stdin to the argv: a plain read only
+            return (argv, peeled) if argv and argv[0] in RAILS_READ_WORDS else None
+    return argv, peeled
+
+
+def _script_is_reads(script, depth):
+    parts = _split_unquoted(script)
+    return bool(parts) and all(_is_read(p, depth + 1) for p in parts)
+
+
+def _argv_is_read(argv, depth, globby=False):
+    got = _peel(argv)
+    if not got or not got[0]:
+        return False
+    argv, peeled = got
+    word = argv[0]
+    if word in _SHELLS or word == "find" or word == "ssh" or peeled:
+        if globby:
+            return False                 # a glob next to a wrapper or an exec can expand into a command
+    if word in _SHELLS:
+        # Only `-c SCRIPT` as the last argument, with no option that loads a profile (-l, -i).
+        for k in range(1, len(argv)):
+            if re.fullmatch(r"-[eux]*c[eux]*", argv[k]):
+                return k == len(argv) - 2 and _script_is_reads(argv[k + 1], depth)
+            if not re.fullmatch(r"-[eux]+", argv[k]):
+                return False
+        return False
+    if word == "find":
+        i = 1
+        while i < len(argv):
+            if argv[i] in _FIND_WRITES:
+                return False
+            if argv[i] in ("-exec", "-execdir"):
+                j = i + 1
+                while j < len(argv) and argv[j] not in (";", "+"):
+                    j += 1
+                if j >= len(argv) or not _argv_is_read(argv[i + 1:j], depth + 1):
+                    return False
+                i = j
+            i += 1
+        return True
+    if word == "ssh":
+        # Local options are where ssh runs local commands (-o ProxyCommand=, -F config), so only
+        # these few are accepted. The remote command is then held to the same rule as a -c script.
+        i = 1
+        while i < len(argv) and argv[i].startswith("-"):
+            if re.fullmatch(r"-[46Tqntv]+", argv[i]) or re.fullmatch(r"-[pil]\S+", argv[i]):
+                i += 1
+            elif argv[i] in ("-p", "-i", "-l"):
+                i += 2
+            else:
+                return False
+        if i >= len(argv) - 1 or _LOCAL_HOST_RE.match(argv[i].rsplit("@", 1)[-1]):
+            return False                 # no remote command, or "remote" is this box
+        return _script_is_reads(" ".join(argv[i + 1:]), depth)
+    return word in RAILS_READ_WORDS
 
 
 def _is_read(fragment, depth=0):
     """True only if `fragment`, all the way down, is one of the permitted reads.
 
-    Wrappers are peeled, an interpreter's -c script must be reads in EVERY part, and a find must
-    write nothing and exec only reads. The answer is about the whole fragment, not about some
-    piece of it: `rm -- <rail> -exec cat {} +` contains a read-shaped piece and is still an rm.
-    Depth-bounded so a nested quote cannot spin; anything unrecognised is not a read.
+    Permitted wrappers (with only their permitted options) are peeled; a shell's -c script, an ssh
+    remote command and every find -exec body must themselves be reads; a find must write nothing.
+    The answer is about the whole fragment: `rm -- <rail> -exec cat {} +` contains a read-shaped
+    piece and is still an rm. Any `$` expansion other than $HOME, a function definition, or a
+    substitution makes it not a read. Depth-bounded; anything unrecognised is not a read.
     """
-    if depth > 4 or _HIDDEN_COMMAND_RE.search(fragment):
+    if depth > 4 or _HIDDEN_COMMAND_RE.search(fragment) or _FUNCTION_DEF_RE.search(fragment):
         return False
-    shape = fragment.strip()
-    while True:
-        peeled = _WRAPPER_RE.sub("", shape, count=1).strip()
-        if peeled == shape or not peeled:
-            break
-        shape = peeled
-    m = _DASH_C_RE.match(shape)
-    if m:
-        inner = [q.strip() for q in _SPLIT.split(m.group("script")) if q.strip()]
-        return bool(inner) and all(_is_read(q, depth + 1) for q in inner)
-    if re.match(r"find(?=\s|$)", shape):
-        if _FIND_WRITE_RE.search(shape):
-            return False
-        bodies = [m.group("cmd") for m in _FIND_EXEC_BODY_RE.finditer(shape)]
-        if len(bodies) != len(_FIND_EXEC_RE.findall(shape)):
-            return False
-        return all(_is_read(b, depth + 1) for b in bodies)
-    return bool(RAILS_READ_RE.match(shape))
+    expands, bare = _unquoted(fragment)
+    if re.search(r"\$(?!HOME\b|\{HOME\})", expands):
+        return False
+    try:
+        argv = shlex.split(fragment)
+    except ValueError:
+        return False
+    globby = bool(_GLOB_RE.search(re.sub(r"(?:^|\s)(?:\{\}|\[|\])(?=\s|$)", " ", bare)))
+    return _argv_is_read(argv, depth, globby)
 
 # The ONLY permitted shape for a command that names the seed or the env: sourcing it so the program
 # that follows inherits the variables. Everything else is refused, whatever program is asking.
@@ -168,10 +331,15 @@ def refuse(command):
     if RAILS_RE.search(cmd):
         if RAILS_REDIRECT_RE.search(cmd):
             return RAILS_REFUSAL
-        for p in parts:
-            # `. /etc/swarm/env` names a rail and is how every tool on the box is started.
-            # The secret path above already permits exactly that shape and nothing else, so
-            # the rails path honours the same exemption rather than inventing a second one.
-            if RAILS_RE.search(p) and not (_is_read(p) or SECRET_SAFE_RE.match(p)):
-                return RAILS_REFUSAL
+        rparts = _split_unquoted(cmd)
+        if rparts is None:
+            return RAILS_REFUSAL
+        # `. /etc/swarm/env && <program>` names a rail and is how every tool on the box is started.
+        # The secret path above permits exactly that shape, so a command whose only mention of a
+        # rail is that sourcing is not a rail command. Any other mention makes it one, and then
+        # EVERY piece of it must be a read: an earlier piece can redefine what a read word runs.
+        if any(RAILS_RE.search(p) and not SECRET_SAFE_RE.match(p) for p in rparts):
+            for p in rparts:
+                if not (_TRUSTED_SETUP_RE.match(p) or _is_read(p)):
+                    return RAILS_REFUSAL
     return None

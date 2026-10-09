@@ -121,7 +121,7 @@ class TheSeedCannotLeave(unittest.TestCase):
         to read the rules it is judged by, through a wrapper as well as bare."""
         G = "/opt/swarm/swarm/guard.py"
         for c in (f"cat {G}", f"bash -c 'cat {G}'", f"sh -c 'grep -c def {G}'",
-                  f"timeout 5 head -40 {G}", f"tail -n 20 {G}", f"less {G}",
+                  f"timeout 5 head -40 {G}", f"tail -n 20 {G}",
                   f"wc -l {G}", f"sha256sum {G}", f"ls -l {G}", f"grep -n RAILS {G}"):
             self.assertAllowed(c)
 
@@ -160,6 +160,87 @@ class TheSeedCannotLeave(unittest.TestCase):
         for c in (f"find /opt/swarm -path {G}", f"find /opt/swarm -path {G} -exec cat {{}} +",
                   f"cat {G} 2>&1", f"[ -f {G} ]"):
             self.assertAllowed(c)
+
+    def test_nothing_earlier_in_the_command_can_change_what_a_read_word_runs(self):
+        """The last fragment said `cat`, so the rails took it for a read. But a shell function, an
+        alias, PATH, BASH_ENV or LD_PRELOAD decides what `cat` actually runs, and every one of these
+        was allowed by the version that only checked the fragment naming the rail. Now every piece
+        of a rail command must be a read, and only harmless variables may be set on the way to one.
+        """
+        G = "/opt/swarm/swarm/guard.py"
+        for c in (f'cat(){{ rm "$1";}}; cat {G}',
+                  f'cat () {{ rm -f -- "$@"; }}; cat {G}',
+                  f"cat () ( exec rm {G} ); cat /etc/hostname",
+                  f'function cat {{ rm "$1"; }}; cat {G}',
+                  f"alias cat=rm; cat {G}",
+                  f"shopt -s expand_aliases && alias cat=rm && cat {G}",
+                  f"env PATH=/tmp/evil cat {G}",
+                  f"env PATH=/tmp/evil:$PATH cat {G}",
+                  f"sudo PATH=/tmp/evil cat {G}",
+                  f"export PATH=/tmp/evil; cat {G}",
+                  f"PATH=/tmp/evil; cat {G}",
+                  f"PATH=/tmp/evil cat {G}",
+                  f"hash -p /bin/rm cat; cat {G}",
+                  f"env BASH_ENV=/tmp/evil.sh bash -c 'cat {G}'",
+                  f"export BASH_ENV=/tmp/evil.sh && bash -c 'cat {G}'",
+                  f"env LD_PRELOAD=/tmp/evil.so cat {G}",
+                  f"trap 'rm -f {G}' EXIT; cat {G}",
+                  f". /tmp/evil/env; cat {G}",
+                  f"source ./env && cat {G}",
+                  f"$CAT {G}",
+                  f"cat {G} $EXTRA",
+                  f"cat $'\\x2d' {G}",
+                  f"timeout 5 * {G}"):
+            self.assertRefused(c)
+
+    def test_no_read_word_on_the_rails_can_run_a_program(self):
+        """`rg --pre <cmd>` runs a program for every file it searches, and rg's config file can add
+        that flag without it appearing in the command; `less` has shell escapes and LESSOPEN. They
+        are off the rails read list -- grep, head and tail read the same bytes and run nothing --
+        and the wrappers only peel with options that cannot load a profile or a command.
+        """
+        G = "/opt/swarm/swarm/guard.py"
+        for c in (f"rg --pre rm x {G}", f"rg --pre=/tmp/evil x {G}", f"rg -n RAILS {G}",
+                  f"less {G}", f"more {G}", f"less '+!rm {G}' {G}",
+                  f"sudo -i cat {G}", f"sudo -s cat {G}", f"bash -l -c 'cat {G}'",
+                  f"bash -i -c 'cat {G}'", f"zsh -c 'cat {G}'", f"bash -c 'cat {G}' x y",
+                  f"exec -a x rm {G}", f"xargs find /opt/swarm -path {G} < /tmp/args",
+                  f"ssh -o ProxyCommand='rm {G}' host cat {G}",
+                  f"ssh -F /tmp/evil_config host cat {G}",
+                  f"ssh host 'cat {G}; rm {G}'",
+                  f"ssh host cat {G} '&&' rm {G}",
+                  f"ssh localhost rm {G}",
+                  f"find /opt/swarm -path {G} -exec rm {{}} \\;",
+                  f"find /opt/swarm -path {G} -exec cat {{}} \\; -exec rm {{}} \\;",
+                  f"find /opt/swarm -path {G} -exec cat {{}} ';' -delete",
+                  f"find /opt/swarm -path {G} -exec {{}} \\;",
+                  f"find /opt/swarm -path {G} -exec cat {{}}",
+                  f"cat {G} >| /tmp/x; cat /tmp/y >| {G}",
+                  f"exec 3<>{G}"):
+            self.assertRefused(c)
+
+    def test_reads_that_were_refused_by_mistake_are_reads(self):
+        """False refusals the first version made: it split on a `|` inside quotes, it would not peel
+        sudo's -n/-u, it had no idea of ssh, and `-exec ... \\;` lost its terminator to the split."""
+        G = "/opt/swarm/swarm/guard.py"
+        for c in (f"grep -E 'a|b' {G}", f"grep -n 'def \\|class' {G}", f"grep -c 'x$' {G}",
+                  f"grep -E \"RAILS|SECRET\" {G} | head -5",
+                  f"sudo -n cat {G}", f"sudo -u root cat {G}", f"sudo -n -u root head -5 {G}",
+                  f"sudo -uroot tail {G}", f"sudo --user=root wc -l {G}",
+                  f"env LC_ALL=C grep x {G}",
+                  f"ssh host cat {G}", f"ssh -p 2222 user@host 'grep -n RAILS {G}'",
+                  f"ssh -T host \"cat {G} | head -5\"",
+                  f"find /opt/swarm -path {G} -exec cat {{}} \\;",
+                  f"find /opt/swarm -path {G} -exec grep -n x {{}} ';'",
+                  f"find /opt/swarm -name guard.py -exec sha256sum {{}} +",
+                  f"bash -c 'cat {G} | grep -c def'",
+                  f". {E} && cat {G}",
+                  "cat $HOME/.ssh/authorized_keys", "cat ~/.ssh/authorized_keys",
+                  "grep -c ssh-ed25519 /root/.ssh/authorized_keys"):
+            self.assertAllowed(c)
+        # Sourcing the env for the program that follows is still not a rail command.
+        self.assertAllowed(f". {E} && python3 src/a01/journal.py")
+        self.assertAllowed(f"set -a; . {E}; set +a; python3 -m pytest tests/")
 
     def test_ordinary_work_is_untouched(self):
         """A lock that blocks the job is not a lock, it is an outage."""
