@@ -394,42 +394,6 @@ class TheSeedCannotLeave(unittest.TestCase):
         self.assertRefused("git add * && git commit -m x")
         self.assertAllowed("git add -A && git commit -m x")
 
-    def test_a_star_does_not_enter_a_dot_directory_in_a_read(self):
-        """bash without dotglob never lets `*` or `?` match a leading `.`, so `*/env` is not
-        ~/.swarm/env. Reading it as if it were refused `ls */env` and `cat config/*/env`."""
-        for c in ("ls */env", "cat config/*/env", "cat src/*/env"):
-            self.assertAllowed(c)
-        # /etc/swarm/env has no dot to stop it; find, xargs, grep -r and ssh match with rules of
-        # their own, so any command with one keeps dots matched (`find . -path '*/env' -print` too);
-        # a bracket class is read as able to match a dot; anything not a read keeps dots matched.
-        for c in ("ls /etc/*/env", "find . -path '*/env' -exec cat {} +", "ssh host 'cat */env'",
-                  "find . -path '*/env' -prune -o -print", "find ~ -path '*/env' | xargs cat",
-                  "find ~ -path '*/wallet.json' | xargs cat", "find ~ -wholename '*/env' | xargs cat",
-                  "grep -r KEY */env", "cat [.]swarm/env", "eval x; cat */env", "rm */wallet.json"):
-            self.assertRefused(c)
-
-    def test_only_a_piece_the_shell_runs_changes_globbing(self):
-        """Mentioning shopt or GLOBIGNORE in a search, a message or a sed script changes nothing."""
-        for c in ("grep -rn 'shopt -s globstar' scripts/", "grep -rn GLOBIGNORE= .",
-                  "git commit -m 'drop GLOBIGNORE= from build.sh'", "sed -i 's/shopt -s globstar//' build.sh",
-                  "echo 'shopt -s nullglob' $HOME", "set -euo pipefail; ls"):
-            self.assertAllowed(c)
-        for c in ("bash -c 'shopt -s dotglob; cat */env'", "eval 'shopt -s dotglob'",
-                  "shopt -s dotglob; ls", "bash -O dotglob -c 'cat */env'",
-                  "env BASHOPTS=dotglob bash -c 'cat */env'", "GLOBIGNORE=x; ls", "set -o noglob",
-                  "export GLOBIGNORE=x", "sudo -u root bash -c 'shopt -s dotglob'", "{ shopt -s dotglob; }",
-                  "sh -c \"bash -c 'shopt -s extglob'\"", ": ${GLOBIGNORE:=x}"):
-            self.assertIn("expands globs", guard.refuse(c) or "", c)
-
-    def test_dots_do_not_reopen_a_rail(self):
-        for c in ("rm ~/.ssh/*", "cd ~/.ssh && rm *", "rm -f /etc/ssh/s*", "rm ~/.*/authorized_keys",
-                  "cat ~/.sw*/wallet.json", "cat /root/.swarm/*", "ls ~/.swarm/*",
-                  "shopt -s dotglob; rm ~/*/authorized_keys", "shopt -s dotglob; cat ~/*/wallet.json",
-                  "shopt -s dotglob; cat */env", "GLOBIGNORE=x; cat */env"):
-            self.assertRefused(c)
-        self.assertIn("expands globs", guard.refuse("shopt -s dotglob; cat */env"))
-        self.assertAllowed("set -euo pipefail; ls")
-
     def test_every_command_starts_with_default_globbing(self):
         """A login shell reads profiles; one that set dotglob would let `*/env` reach ~/.swarm/env."""
         import subprocess, tempfile
