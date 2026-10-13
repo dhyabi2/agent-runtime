@@ -242,6 +242,64 @@ class TheSeedCannotLeave(unittest.TestCase):
         self.assertAllowed(f". {E} && python3 src/a01/journal.py")
         self.assertAllowed(f"set -a; . {E}; set +a; python3 -m pytest tests/")
 
+    def test_quoting_globs_and_braces_do_not_hide_a_rail(self):
+        """The rails were found by a regex over the raw text, so anything that changed the spelling
+        but not the file -- a quote, a backslash, `//`, `./`, a glob, a brace -- was not a rail at
+        all, and every one of these was allowed, wrapper or not. A word is now read the way the
+        shell will read it, and a pattern that could expand to a rail is one.
+        """
+        for c in ('rm "/opt/swarm/swarm/"guard.py',
+                  "rm /opt/swarm/swarm/gu\\ard.py",
+                  "rm /opt/swarm/swarm/gu''ard.py",
+                  "sudo rm /opt/swarm/swarm//guard.py",
+                  "nice rm /opt/swarm/swarm/./guard.py",
+                  "bash -c 'rm \"/opt/swarm/swarm/\"guard.py'",
+                  'cat /etc/hostname > /opt/swarm/swarm/"guard.py"',
+                  'cat /etc/hostname > "x y/../../opt/swarm/swarm/guard.py"',
+                  "rm /opt/swarm/swarm/$'\\x67uard.py'",
+                  "rm /opt/swarm/swarm/g*.py",
+                  "rm /opt/swarm/sw*/guard.py",
+                  "rm /opt/swarm/swarm/guar?.py",
+                  "rm /opt/swarm/swarm/[g]uard.py",
+                  "rm /opt/swarm/swarm/*",
+                  "rm /opt/**/guard.py",
+                  "env rm /opt/swarm/{swarm,x}/guard.py",
+                  "sudo rm /opt/swarm/swarm/{guard,x}.py",
+                  "rm /opt/swarm/{a..z}warm/guard.py",
+                  "nice -n 5 rm /root/.ssh/authorized_{keys,x}",
+                  "command rm /etc/ssh/sshd_conf{i,x}g",
+                  "find / -name 'sshd*' -delete",
+                  "cp /tmp/k ~/.ssh/auth*",
+                  "echo x > /opt/swarm/swarm/g*",
+                  # The seed and the env are matched with the quoting undone as well.
+                  'cat "/root/.swarm/"wallet.json',
+                  'cat /etc/swarm/"env"',
+                  "vi /root/.swarm/wall\\et.json"):
+            self.assertRefused(c)
+
+    def test_a_word_that_only_looks_like_a_rail_is_not_one(self):
+        """The same regex matched inside any longer word, so a test file, a note or a commit message
+        that merely mentioned sshd_config or authorized_keys was refused as if it were the file.
+        A rail is now whole path components; reads through a quote or a glob are still reads."""
+        G = "/opt/swarm/swarm/guard.py"
+        for c in ("python3 -m pytest tests/test_sshd_config_lint.py",
+                  "vi src/sshd_config_parser.py",
+                  "vi notes/authorized_keys_rotation.md",
+                  "python3 tools/check_authorized_keys_format.py",
+                  "git commit -m 'fix authorized_keys_check typo'",
+                  "echo 'see sshd_config_notes' >> log.txt",
+                  "rm /tmp/sshd_config_backup_2026.tgz",
+                  "cp /etc/swarm/environment.example /tmp/x",
+                  "rm -f /opt/swarm/swarm/guard.py.orig",
+                  "rm -rf /tmp/build/*.pyc", "cp *.txt /tmp/out/", "rm -f /tmp/x/{a,b}.log",
+                  "git add runtime/*.py",
+                  "sudo systemctl status swarm-agent@a01", "nice -n 10 python3 -m pytest tests/",
+                  "command -v python3", "env LC_ALL=C sort data.txt",
+                  "git commit -m 'guard: refuse env/sudo/nice wrappers'",
+                  f"sudo -n cat '{G}'", f'grep -n RAILS "{G}"', "ls /opt/swarm/swarm/*",
+                  "head -5 /opt/swarm/swarm/g*.py"):
+            self.assertAllowed(c)
+
     def test_ordinary_work_is_untouched(self):
         """A lock that blocks the job is not a lock, it is an outage."""
         for c in ("git commit -am 'a01: faster journal read'", "python3 -m pytest tests/",

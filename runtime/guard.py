@@ -12,6 +12,7 @@ The owner (2026-09-19) chose full autonomy for this runtime: it merges its own c
 for anything. That makes the money lock the ONLY thing standing between a bad turn and the wallet, so the
 amounts live here in code and nowhere else — not in env, not in config, not in the prompt.
 """
+import posixpath
 import re
 import shlex
 
@@ -44,7 +45,12 @@ GH_CREATE_RE = re.compile(r"\bgh\s+(?:issue|pr)\s+create\b")
 X_POST_RE = re.compile(r"\brai-x\b|api\.(?:twitter|x)\.com|\b(?:tweet|post-newsletter|answer-replies)\b", re.I)
 
 # The agent may rewrite its own code freely (that is the point), but not the things that keep it honest.
-RAILS_RE = re.compile(r"(?:/swarm/guard\.py|/etc/swarm/env|\.swarm/wallet\.json|sshd_config|authorized_keys)")
+# Each rail is a run of whole path components: a word names it when, with the shell's quoting undone,
+# its components contain that run. Whole components, so `test_sshd_config.py` and
+# `/etc/swarm/environment.example` are not rails; quoting undone, so `"/opt/swarm/swarm/"guard.py`
+# and `gu\ard.py` are. sshd_config.d is included by sshd_config, and sshd reads authorized_keys2.
+RAIL_PATHS = ("swarm/guard.py", "etc/swarm/env", ".swarm/wallet.json",
+              "sshd_config", "sshd_config.d", "authorized_keys", "authorized_keys2")
 _SPLIT = re.compile(r"&&|\|\||;|\||\n")
 
 # The rails fail CLOSED, like the seed and the env below, and for the reason this file already
@@ -73,9 +79,6 @@ _SPLIT = re.compile(r"&&|\|\||;|\||\n")
 RAILS_READ_WORDS = frozenset((
     "cat", "head", "tail", "nl", "wc", "grep", "egrep", "fgrep", "stat", "ls", "file", "md5sum",
     "sha256sum", "sha1sum", "cmp", "diff", "realpath", "readlink", "dirname", "basename", "test", "["))
-RAILS_REDIRECT_RE = re.compile(
-    r"(?:<>|>)[>|&]*\s*\S*(?:/swarm/guard\.py|/etc/swarm/env|\.swarm/wallet\.json|sshd_config"
-    r"|authorized_keys)")
 # On a rail command the env may be sourced only from the rail itself: SECRET_SAFE_RE below accepts
 # any file whose name ends in `env`, and `. /tmp/x/env; cat <rail>` would let that file redefine cat.
 _TRUSTED_SETUP_RE = re.compile(r"^(?:set\s+[-+]a|(?:\.|source)\s+/etc/swarm/env)$")
@@ -279,6 +282,117 @@ def _is_read(fragment, depth=0):
     globby = bool(_GLOB_RE.search(re.sub(r"(?:^|\s)(?:\{\}|\[|\])(?=\s|$)", " ", bare)))
     return _argv_is_read(argv, depth, globby)
 
+
+# Words are cut at whatever cannot be part of a path (`of=`, `f=@`, `host:`, `open(`, `$HOME`),
+# after the quoting is undone. Commas are cut later, outside braces, where they are not a brace's.
+_WORD_SPLIT_RE = re.compile(r"[\s;&|<>()=`$:@]+")
+_ANSI_C_ESCAPE_RE = re.compile(r"\$'[^']*\\")     # $'\x67uard.py' spells a path no regex can read
+_REDIRECT_OP_RE = re.compile(r"^[<>&|0-9]*>[<>&|]*$")
+# A run of glob components longer than this cannot be one rail, unless `**`s pad it out.
+_RAIL_DEPTH = max(r.count("/") for r in RAIL_PATHS) + 1 + 3
+
+
+def _plain(text):
+    """The text with every quote and backslash removed: `"/opt/swarm/"gu\\ard.py` is that path to bash."""
+    return re.sub(r"['\"\\]", "", text)
+
+
+def _brace_expand(word, budget=64):
+    """bash's {a,b} expansion. A {x..y} sequence becomes `*`, and more than the budget becomes `**`:
+    each is wider than what it replaces, never narrower."""
+    first, last = word.find("{"), word.rfind("}")
+    if first == -1 or last < first:
+        return [word]
+    if word.count("{") > 6:
+        return [word[:first] + "**" + word[last + 1:]]
+    start = first
+    while start != -1:
+        depth, alts, mark, k = 0, [], start + 1, start
+        for k in range(start, len(word)):
+            if word[k] == "{":
+                depth += 1
+            elif word[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif word[k] == "," and depth == 1:
+                alts.append(word[mark:k]); mark = k + 1
+        else:
+            return [word]                             # never closed: bash leaves it as written
+        pre, body, post = word[:start], word[start + 1:k], word[k + 1:]
+        if alts:
+            out = []
+            for alt in alts + [word[mark:k]]:
+                out.extend(_brace_expand(pre + alt + post, budget))
+                if len(out) > budget:
+                    return _brace_expand(pre + "**" + post, budget)
+            return out
+        if re.fullmatch(r"-?\w+\.\.-?\w+(?:\.\.-?\d+)?", body):
+            return _brace_expand(pre + "*" + post, budget)
+        start = word.find("{", start + 1)
+    return [word]
+
+
+def _glob_re(glob):
+    """A shell glob as a regex: `*` and `?` stay inside one component, `**` crosses them, and a
+    bracket class becomes any one character (wider than the class, never narrower)."""
+    out, i = [], 0
+    while i < len(glob):
+        if glob.startswith("**/", i):
+            out.append("(?:.*/)?"); i += 3; continue
+        if glob.startswith("**", i):
+            out.append(".*"); i += 2; continue
+        c = glob[i]
+        if c == "*":
+            out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        elif c == "[" and glob.find("]", i + 2) != -1:
+            out.append("[^/]"); i = glob.find("]", i + 2)
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.compile("".join(out))
+
+
+def _path_is_rail(path):
+    """True if `path`, or any file a glob in it could expand to, contains a rail's components."""
+    for p in {path, posixpath.normpath(path)}:
+        if not _GLOB_RE.search(p):
+            if any(f"/{r}/" in f"/{p}/" for r in RAIL_PATHS):
+                return True
+            continue
+        comps = p.split("/")
+        for i in range(len(comps)):
+            for j in range(i + 1, min(i + _RAIL_DEPTH, len(comps)) + 1):
+                rx = _glob_re("/".join(comps[i:j]))
+                if any(rx.fullmatch(r) for r in RAIL_PATHS):
+                    return True
+    return False
+
+
+def _names_rail(text):
+    """True if any word in `text` is, or could expand to, a rail path. When unsure, it does."""
+    if _ANSI_C_ESCAPE_RE.search(text):
+        return True
+    for word in _WORD_SPLIT_RE.split(_plain(text)):
+        for expanded in _brace_expand(word):
+            if any(piece and _path_is_rail(piece) for piece in expanded.split(",")):
+                return True
+    return False
+
+
+def _writes_to_rail(fragment):
+    """True if a redirection in `fragment` targets a rail, however the target is quoted. A fragment
+    shlex cannot tokenise counts as one."""
+    try:
+        lex = shlex.shlex(fragment, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return True
+    return any(_REDIRECT_OP_RE.match(t) and _names_rail(nxt) for t, nxt in zip(tokens, tokens[1:]))
+
 # The ONLY permitted shape for a command that names the seed or the env: sourcing it so the program
 # that follows inherits the variables. Everything else is refused, whatever program is asking.
 SECRET_SAFE_RE = re.compile(r"^(?:set\s+[-+]a|(?:\.|source)\s+\S*(?:env|\.env)\s*)$")
@@ -309,9 +423,10 @@ def refuse(command):
         return "Blocked: that dumps every variable, keys included. Keys are used by programs, never printed."
     # The seed and the env fail CLOSED: it is not enough to list the programs that may not read them,
     # because the list will always be missing one. Here it was every editor.
-    if SECRET_VAR_RE.search(cmd) or ENV_PATH_RE.search(cmd):
+    # Matched with the quoting undone too: `cat "/root/.swarm/"wallet.json` is the same file.
+    if any(SECRET_VAR_RE.search(t) or ENV_PATH_RE.search(t) for t in (cmd, _plain(cmd))):
         for p in parts:
-            if not (SECRET_VAR_RE.search(p) or ENV_PATH_RE.search(p)):
+            if not any(SECRET_VAR_RE.search(t) or ENV_PATH_RE.search(t) for t in (p, _plain(p))):
                 continue                      # this fragment does not name a secret; it is not the issue
             if SECRET_SAFE_RE.match(p):
                 continue                      # loading the env for the program that follows is fine
@@ -328,8 +443,8 @@ def refuse(command):
                 "one place a mistake cannot be taken back. Record the result in the journal instead — the "
                 "live map publishes it, and the swarm's other agents can post it once it is proven.")
 
-    if RAILS_RE.search(cmd):
-        if RAILS_REDIRECT_RE.search(cmd):
+    if _names_rail(cmd):
+        if _writes_to_rail(cmd):
             return RAILS_REFUSAL
         rparts = _split_unquoted(cmd)
         if rparts is None:
@@ -338,7 +453,7 @@ def refuse(command):
         # The secret path above permits exactly that shape, so a command whose only mention of a
         # rail is that sourcing is not a rail command. Any other mention makes it one, and then
         # EVERY piece of it must be a read: an earlier piece can redefine what a read word runs.
-        if any(RAILS_RE.search(p) and not SECRET_SAFE_RE.match(p) for p in rparts):
+        if any(_names_rail(p) and not SECRET_SAFE_RE.match(p) for p in rparts):
             for p in rparts:
                 if not (_TRUSTED_SETUP_RE.match(p) or _is_read(p)):
                     return RAILS_REFUSAL
