@@ -57,7 +57,7 @@ RAIL_PATHS = ("swarm/guard.py", "etc/swarm/env", ".swarm/wallet.json",
 RAILS_RE = re.compile(
     r"(?:/swarm/guard\.py|/etc/swarm/env|\.swarm/wallet\.json"
     r"|(?<![A-Za-z0-9_-])(?:sshd_config|authorized_keys))(?![A-Za-z0-9_-])")
-_MAX_RAIL_SCAN = 65536      # past this the word-by-word reading is skipped and only the backstop runs
+_MAX_RAIL_SCAN = 65536      # past this a command is refused unread: the backstop alone misses globs and quotes
 _SPLIT = re.compile(r"&&|\|\||;|\||\n")
 
 # The rails fail CLOSED, like the seed and the env below, and for the reason this file already
@@ -428,8 +428,8 @@ def _names_rail(text):
 
 
 def _mentions_rail(text):
-    """The backstop, then (for text of a sane size) the word-by-word reading."""
-    return bool(RAILS_RE.search(text)) or (len(text) <= _MAX_RAIL_SCAN and _names_rail(text))
+    """The backstop, then the word-by-word reading. refuse() never lets text past _MAX_RAIL_SCAN here."""
+    return bool(RAILS_RE.search(text)) or _names_rail(text)
 
 
 def _strip_comments(cmd):
@@ -484,6 +484,20 @@ RAILS_REFUSAL = (
     "thing that checks you. Read them with cat/head/grep if you need to see the rules.")
 
 
+TOO_LONG_REFUSAL = (
+    f"Blocked: command too long to check (over {_MAX_RAIL_SCAN} characters); split it. A command the "
+    "guard cannot read in full is not run, whatever it says.")
+_BARE_GLOB_RE = re.compile(r"(?:^|[\s/])[*?]+(?=[\s;&|)]|$)")
+
+
+def _rails_refusal(cmd):
+    """RAILS_REFUSAL, saying so when a bare `*` or `?` was what could reach a rail."""
+    if _BARE_GLOB_RE.search(cmd):
+        return (RAILS_REFUSAL + " Here a bare `*`/`?` glob was the trigger: it could expand to a "
+                "rail. Name the files you mean explicitly.")
+    return RAILS_REFUSAL
+
+
 def refuse(command):
     """Return a refusal string, or None to allow. The refusal is shown to the agent verbatim."""
     cmd = str(command or "")
@@ -522,13 +536,15 @@ def refuse(command):
                 "one place a mistake cannot be taken back. Record the result in the journal instead — the "
                 "live map publishes it, and the swarm's other agents can post it once it is proven.")
 
+    if len(cmd) > _MAX_RAIL_SCAN:
+        return TOO_LONG_REFUSAL
     cmd = _strip_comments(cmd)
     if _mentions_rail(cmd):
-        if len(cmd) > _MAX_RAIL_SCAN or _writes_to_rail(cmd):
-            return RAILS_REFUSAL
+        if _writes_to_rail(cmd):
+            return _rails_refusal(cmd)
         rparts = _split_unquoted(cmd)
         if rparts is None:
-            return RAILS_REFUSAL
+            return _rails_refusal(cmd)
         # `. /etc/swarm/env && <program>` names a rail and is how every tool on the box is started.
         # The secret path above permits exactly that shape, so a command whose only mention of a
         # rail is that sourcing is not a rail command. Any other mention makes it one, and then
@@ -536,5 +552,5 @@ def refuse(command):
         if any(_mentions_rail(p) and not SECRET_SAFE_RE.match(p) for p in rparts):
             for p in rparts:
                 if not (_TRUSTED_SETUP_RE.match(p) or _is_read(p)):
-                    return RAILS_REFUSAL
+                    return _rails_refusal(cmd)
     return None

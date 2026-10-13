@@ -342,6 +342,20 @@ class TheSeedCannotLeave(unittest.TestCase):
         self.assertLess(time.time() - t, 5)
         self.assertTrue(guard.refuse("rm " + "x" * 70000 + " /opt/swarm/swarm/guard.py"))
 
+    def test_padding_a_command_past_the_scan_limit_does_not_skip_the_check(self):
+        """Past the size limit only the substring backstop used to run, and it cannot see a glob or
+        a quote: each of these was allowed once padded. Anything over the limit is now refused."""
+        pad = "\necho " + "x" * 70000
+        for c in ("rm -f /etc/ssh/s*", "cd ~/.ssh && rm *", 'rm -f "/etc/ssh/"sshd_conf"ig"',
+                  "rm /root/.swarm/*"):
+            self.assertRefused(c)
+            self.assertIn("too long", guard.refuse(c + pad))
+        self.assertIn("too long", guard.refuse("echo " + "x" * 70000))
+
+    def test_a_bare_glob_refusal_says_the_glob_was_the_trigger(self):
+        self.assertIn("glob was the trigger", guard.refuse("cd /etc/ssh && rm -f *"))
+        self.assertNotIn("glob", guard.refuse("rm /opt/swarm/swarm/guard.py"))
+
     def test_ordinary_work_is_untouched(self):
         """A lock that blocks the job is not a lock, it is an outage."""
         for c in ("git commit -am 'a01: faster journal read'", "python3 -m pytest tests/",
