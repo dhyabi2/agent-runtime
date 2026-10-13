@@ -397,14 +397,29 @@ class TheSeedCannotLeave(unittest.TestCase):
     def test_a_star_does_not_enter_a_dot_directory_in_a_read(self):
         """bash without dotglob never lets `*` or `?` match a leading `.`, so `*/env` is not
         ~/.swarm/env. Reading it as if it were refused `ls */env` and `cat config/*/env`."""
-        for c in ("ls */env", "cat config/*/env", "cat src/*/env",
-                  "find . -path '*/env' -prune -o -print"):
+        for c in ("ls */env", "cat config/*/env", "cat src/*/env"):
             self.assertAllowed(c)
-        # /etc/swarm/env has no dot to stop it; find and ssh match with rules of their own;
+        # /etc/swarm/env has no dot to stop it; find, xargs, grep -r and ssh match with rules of
+        # their own, so any command with one keeps dots matched (`find . -path '*/env' -print` too);
         # a bracket class is read as able to match a dot; anything not a read keeps dots matched.
         for c in ("ls /etc/*/env", "find . -path '*/env' -exec cat {} +", "ssh host 'cat */env'",
-                  "cat [.]swarm/env", "eval x; cat */env", "rm */wallet.json"):
+                  "find . -path '*/env' -prune -o -print", "find ~ -path '*/env' | xargs cat",
+                  "find ~ -path '*/wallet.json' | xargs cat", "find ~ -wholename '*/env' | xargs cat",
+                  "grep -r KEY */env", "cat [.]swarm/env", "eval x; cat */env", "rm */wallet.json"):
             self.assertRefused(c)
+
+    def test_only_a_piece_the_shell_runs_changes_globbing(self):
+        """Mentioning shopt or GLOBIGNORE in a search, a message or a sed script changes nothing."""
+        for c in ("grep -rn 'shopt -s globstar' scripts/", "grep -rn GLOBIGNORE= .",
+                  "git commit -m 'drop GLOBIGNORE= from build.sh'", "sed -i 's/shopt -s globstar//' build.sh",
+                  "echo 'shopt -s nullglob' $HOME", "set -euo pipefail; ls"):
+            self.assertAllowed(c)
+        for c in ("bash -c 'shopt -s dotglob; cat */env'", "eval 'shopt -s dotglob'",
+                  "shopt -s dotglob; ls", "bash -O dotglob -c 'cat */env'",
+                  "env BASHOPTS=dotglob bash -c 'cat */env'", "GLOBIGNORE=x; ls", "set -o noglob",
+                  "export GLOBIGNORE=x", "sudo -u root bash -c 'shopt -s dotglob'", "{ shopt -s dotglob; }",
+                  "sh -c \"bash -c 'shopt -s extglob'\"", ": ${GLOBIGNORE:=x}"):
+            self.assertIn("expands globs", guard.refuse(c) or "", c)
 
     def test_dots_do_not_reopen_a_rail(self):
         for c in ("rm ~/.ssh/*", "cd ~/.ssh && rm *", "rm -f /etc/ssh/s*", "rm ~/.*/authorized_keys",
@@ -427,6 +442,7 @@ class TheSeedCannotLeave(unittest.TestCase):
             out = subprocess.run(["bash", "-c", "shopt -s dotglob extglob\n" + agent.GLOB_RESET + "echo */env"],
                                  cwd=d, capture_output=True, text=True).stdout.split()
         self.assertEqual(out, ["cfg/env"])
+        self.assertNotIn(" ENV", agent.GLOB_RESET)     # ENV=production is an app's own variable
 
     def test_the_too_long_refusal_says_how(self):
         self.assertIn(">>", guard.refuse("echo " + "x" * 70000))

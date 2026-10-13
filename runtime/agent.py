@@ -91,7 +91,7 @@ def blocks_from(text):
 # The guard reads a glob the way default bash expands it. A login shell reads profiles, which could
 # turn on dotglob and let `*/env` reach ~/.swarm/env, so the options go back to default before the
 # command. Its own line: bash parses a whole line before running any of it, extglob included.
-GLOB_RESET = "shopt -u dotglob extglob globstar nocaseglob; unset GLOBIGNORE BASH_ENV ENV\n"
+GLOB_RESET = "shopt -u dotglob extglob globstar nocaseglob; unset GLOBIGNORE BASH_ENV\n"
 
 
 def run_tool(cmd, timeout=180):

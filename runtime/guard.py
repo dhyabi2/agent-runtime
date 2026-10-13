@@ -625,13 +625,112 @@ def _is_glob_read(fragment):
 
 
 # Shell options that change what a glob expands to. The guard reads globs the default way, so a
-# command that changes them is not run; agent.py turns them off before every command, against a
-# profile that turned them on. `shopt` with an expansion could name any of them.
-_GLOB_MODE_RE = re.compile(r"\bshopt\b[^\n;&|]*(?:\b(?:dotglob|extglob|globstar|nocaseglob)\b|[$`\\])"
-                           r"|\b(?:GLOBIGNORE|BASHOPTS)\s*=")
-# Where a pattern is not globbed by this shell: a remote shell globs with its own options, and
-# find matches `-path '*/env'` with no rule about dots, then hands what it found to -exec.
-_OTHER_GLOBBER_RE = re.compile(r"\bssh\b|-exec|-ok")
+# command that RUNS something changing them is not run; agent.py turns them off before every command,
+# against a profile that turned them on. Only a piece the shell will run counts: `grep -rn 'shopt -s
+# globstar' scripts/` and `git commit -m 'drop GLOBIGNORE='` only mention them. Code handed to
+# `bash -c`, `sh -c` or `eval` is run, so it is read the same way, all the way down.
+_GLOB_VARS = ("GLOBIGNORE", "BASHOPTS")
+_GLOB_SHELLS = frozenset(("bash", "sh", "dash", "ksh", "zsh", "rbash"))
+_GLOB_WRAPPERS = frozenset(set(_WRAPPERS) | {"builtin", "chroot", "nsenter", "unshare", "runuser", "su",
+                                               "flock", "watch", "strace", "ltrace", "chrt", "taskset"})
+_ASSIGNING_BUILTINS = frozenset(("export", "declare", "typeset", "local", "readonly", "read", "printf",
+                                 "mapfile", "readarray", "let"))
+_HARMLESS_SET_O = frozenset(("pipefail", "errexit", "nounset", "xtrace", "verbose", "errtrace"))
+_SHELL_KEYWORDS = frozenset(("{", "}", "(", ")", "!", "if", "then", "else", "elif", "do", "while", "until",
+                             "time", "coproc"))
+
+
+def _sets_o(args):
+    """True if `set`/`bash` options in `args` turn on a -o/+o option that is not a harmless one."""
+    for k, a in enumerate(args):
+        if re.fullmatch(r"[-+][A-Za-z]*o[A-Za-z]*", a):
+            if k + 1 < len(args) and args[k + 1] not in _HARMLESS_SET_O:
+                return True
+    return False
+
+
+def _argv_changes_glob_mode(argv, depth):
+    i = 0
+    while i < len(argv):
+        w = argv[i].lstrip("({!")
+        if not w or w in _SHELL_KEYWORDS:
+            i += 1; continue
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]]*\])?\+?=", w)
+        if m:
+            if m.group(1) in _GLOB_VARS:
+                return True
+            i += 1; continue
+        break
+    if i >= len(argv):
+        return False
+    word, rest = posixpath.basename(argv[i].lstrip("({!")), argv[i + 1:]
+    if word == "shopt":
+        return True
+    if word == "set":
+        return _sets_o(rest)
+    if word in _ASSIGNING_BUILTINS:
+        return any(a.lstrip("-").startswith(_GLOB_VARS) for a in rest)
+    if word in _GLOB_SHELLS:
+        if any(re.fullmatch(r"[-+][A-Za-z]*O[A-Za-z]*", a) for a in rest) or _sets_o(rest):
+            return True
+        # Every other word is read as code: the -c script is one of them, wherever it sits.
+        return any(_changes_glob_mode(a, depth + 1) for a in rest if not a.startswith(("-", "+")))
+    if word == "eval":
+        return _changes_glob_mode(" ".join(rest), depth + 1)
+    if word in _GLOB_WRAPPERS:
+        # Not worth knowing each wrapper's options: any later word that could change globbing is
+        # read as the command it would be, nested wrappers and all.
+        if depth > 4:
+            return True
+        risky = _GLOB_SHELLS | _ASSIGNING_BUILTINS | {"shopt", "set", "eval"}
+        ks = [k for k in range(len(rest)) if posixpath.basename(rest[k].lstrip("({!")) in risky or "=" in rest[k]]
+        if len(ks) > 32:
+            return True                       # past this it is not a command anyone means; unread is refused
+        return any(_argv_changes_glob_mode(rest[k:], depth + 1) for k in ks)
+    return False
+
+
+def _changes_glob_mode(cmd, depth=0):
+    """True if a piece of `cmd` the shell will run changes how globs expand: `shopt` as a command,
+    `set -o`/`+o` (other than the harmless ones), `bash -O`/`+O`, or an assignment to GLOBIGNORE or
+    BASHOPTS. Anything it cannot read the way the shell would counts as changing it."""
+    if depth > 4 or re.search(r"\$\{(?:GLOBIGNORE|BASHOPTS)\b", cmd):
+        return True
+    pieces = _split_unquoted(cmd)
+    if pieces is None:
+        return True
+    for p in pieces:
+        try:
+            argv = shlex.split(p)
+        except ValueError:
+            return True
+        if _argv_changes_glob_mode(argv, depth):
+            return True
+    return False
+
+
+# Commands that never match a pattern of their own: a `*` in their arguments was expanded by this
+# shell and nothing else. Only a command made of these may glob without dots (see refuse()).
+# Not on it: find, xargs, rg, fd, locate, git, tar, ssh, a shell's -c, any wrapper -- each matches
+# patterns its own way, or hands names to something that does. grep only without recursion.
+_NO_PATTERN_READS = frozenset(RAILS_READ_WORDS) - {"test", "["}
+_SELF_MATCHER_RE = re.compile(r"\b(?:ssh|find|xargs|rg|fd|fdfind|locate|plocate|mlocate)\b|-exec|-ok"
+                              r"|-(?:i?path|wholename|iwholename|i?name|i?regex)\b")
+
+
+def _globs_like_bash_only(fragment):
+    """True if `fragment` is a plain read whose every pattern bash itself expands."""
+    if not _is_read(fragment):
+        return False
+    argv = shlex.split(fragment)
+    if not argv or argv[0] not in _NO_PATTERN_READS:
+        return False
+    if argv[0] in ("grep", "egrep", "fgrep") and any(
+            re.match(r"-[^-]*[rRd]|--(?:r|dereference|d|incl|excl)", a) for a in argv[1:]):
+        return False
+    return True
+
+
 GLOB_MODE_REFUSAL = (
     "Blocked: that changes how the shell expands globs (dotglob, extglob, globstar, nocaseglob, "
     "GLOBIGNORE). The guard reads globs the way bash does by default; name the files instead.")
@@ -660,16 +759,17 @@ def refuse(command):
     # Past _MAX_RAIL_SCAN the word-by-word reading is skipped; such a command is refused below anyway.
     # A command made only of reads globs the default way (agent.py resets the options a profile
     # could set), so its `*` does not enter a dot-directory: `ls */env` is not the env. Anything
-    # else, which could have changed the options (`eval`, `source`, ...), keeps dots matched.
-    if _GLOB_MODE_RE.search(cmd) or _GLOB_MODE_RE.search(_plain(cmd)):
+    # else, which could have changed the options (`eval`, `source`, ...), or which matches patterns
+    # itself (find, xargs, grep -r, git, tar, ...), keeps dots matched.
+    if len(cmd) <= _MAX_RAIL_SCAN and _changes_glob_mode(cmd):
         return GLOB_MODE_REFUSAL
     dots = True
     names_secret = lambda t: (SECRET_VAR_RE.search(t) or SECRET_VAR_RE.search(_plain(t))
                               or (_names_secret(t, dots) if len(t) <= _MAX_RAIL_SCAN
                                   else ENV_PATH_RE.search(_plain(t))))
-    if names_secret(cmd) and len(cmd) <= _MAX_RAIL_SCAN and not _OTHER_GLOBBER_RE.search(_plain(cmd)):
+    if names_secret(cmd) and len(cmd) <= _MAX_RAIL_SCAN and not _SELF_MATCHER_RE.search(_plain(cmd)):
         rp = _split_unquoted(_strip_comments(cmd))
-        dots = not (rp and all(_TRUSTED_SETUP_RE.match(p) or _is_read(p) or _is_glob_read(p) for p in rp))
+        dots = not (rp and all(_TRUSTED_SETUP_RE.match(p) or _globs_like_bash_only(p) for p in rp))
     if names_secret(cmd):
         for p in parts:
             if not names_secret(p):

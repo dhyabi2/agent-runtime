@@ -78,6 +78,9 @@ glob expands to `sshd_config` or `authorized_keys`. Name the files, or give the 
 prefix (`rm -rf build/*`). A command that only reads what the glob matches (`git add *`,
 `tar czf a.tgz *`) is allowed on its own, but every piece of a command must be a read, so
 `git add * && git commit -m x` is still refused: use `git add -A && git commit -m x` instead.
+The guard reads globs the way default bash expands them, so a command that runs `shopt`, `set -o`,
+`bash -O`, or sets `GLOBIGNORE`/`BASHOPTS` is refused, and `agent.py` turns dotglob, extglob, globstar
+and nocaseglob off (and unsets `GLOBIGNORE` and `BASH_ENV`) before every command it runs.
 
 ## Using it
 
