@@ -356,6 +356,35 @@ class TheSeedCannotLeave(unittest.TestCase):
         self.assertIn("glob was the trigger", guard.refuse("cd /etc/ssh && rm -f *"))
         self.assertNotIn("glob", guard.refuse("rm /opt/swarm/swarm/guard.py"))
 
+    def test_a_command_that_only_reads_its_glob_is_a_read(self):
+        """`git add *` and `tar czf a.tgz *` were refused because `*` could match sshd_config,
+        though neither writes what the glob matches. The tar archive is still a write target."""
+        for c in ("git add *", "git diff *", "git status *", "tar czf a.tgz *", "tar -tf a.tgz *"):
+            self.assertAllowed(c)
+        for c in ("tar czf ~/.ssh/authorized_keys *", "tar --file=/etc/ssh/sshd_config -c *",
+                  "tar cf a.tgz --remove-files *", "tar xzf a.tgz *", "git -c core.fsmonitor=x add *",
+                  "git diff --output=x *", "git add * > x", "rm *", "chmod 644 *", "cp * dir/"):
+            self.assertRefused(c)
+
+    def test_the_glob_hint_is_given_only_when_the_glob_was_the_trigger(self):
+        for c in ("rm *", "rm -rf */__pycache__", "rm */*.log", "rm '*'"):
+            self.assertIn("glob was the trigger", guard.refuse(c))
+        r = guard.refuse("rm * && vi /etc/ssh/sshd_config")
+        self.assertTrue(r)
+        self.assertNotIn("glob was the trigger", r)
+
+    def test_the_too_long_refusal_says_how(self):
+        self.assertIn(">>", guard.refuse("echo " + "x" * 70000))
+
+    def test_the_journal_keeps_the_whole_refusal(self):
+        """agent.py cut the logged reason at 300 characters, so the glob hint never reached the journal."""
+        import inspect, re
+        import agent
+        cut = re.search(r'"why": blocked\[:(\d+)\]', inspect.getsource(agent.run_tool))
+        self.assertTrue(cut)
+        for c in ("rm *", "echo " + "x" * 70000):
+            self.assertGreaterEqual(int(cut.group(1)), len(guard.refuse(c)))
+
     def test_ordinary_work_is_untouched(self):
         """A lock that blocks the job is not a lock, it is an outage."""
         for c in ("git commit -am 'a01: faster journal read'", "python3 -m pytest tests/",

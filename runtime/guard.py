@@ -485,17 +485,116 @@ RAILS_REFUSAL = (
 
 
 TOO_LONG_REFUSAL = (
-    f"Blocked: command too long to check (over {_MAX_RAIL_SCAN} characters); split it. A command the "
-    "guard cannot read in full is not run, whatever it says.")
-_BARE_GLOB_RE = re.compile(r"(?:^|[\s/])[*?]+(?=[\s;&|)]|$)")
+    f"Blocked: command too long to check (over {_MAX_RAIL_SCAN} characters); split it, e.g. write a "
+    "large file in parts with `>>`. A command the guard cannot read in full is not run, whatever it says.")
+# A word with a component that is nothing but `*`/`?` (`*`, `*/__pycache__`, `logs/?`), quoting
+# undone: `'*'` is refused as if bash could glob it, so the hint names it too.
+_HINT_SPLIT_RE = re.compile(r"([\s;&|<>()`=]+)")
+
+
+def _bare_glob_word(word):
+    return any(re.fullmatch(r"[*?]+", c) for c in word.split("/"))
+
+
+def _glob_was_the_trigger(cmd):
+    """True when a bare-glob word is all that makes `cmd` name a rail: with those words gone, no
+    rail is left. `rm * && vi /etc/ssh/sshd_config` still names one, so the glob is not blamed."""
+    words = _HINT_SPLIT_RE.split(_plain(cmd))
+    if not any(_bare_glob_word(w) for w in words[::2]):
+        return False
+    rest = "".join("x" if k % 2 == 0 and _bare_glob_word(w) else w for k, w in enumerate(words))
+    return not _mentions_rail(rest)
 
 
 def _rails_refusal(cmd):
     """RAILS_REFUSAL, saying so when a bare `*` or `?` was what could reach a rail."""
-    if _BARE_GLOB_RE.search(cmd):
+    if _glob_was_the_trigger(cmd):
         return (RAILS_REFUSAL + " Here a bare `*`/`?` glob was the trigger: it could expand to a "
                 "rail. Name the files you mean explicitly.")
     return RAILS_REFUSAL
+
+
+# Commands that only READ the files their operands glob to, so a bare `*` among them reaches a rail
+# only to read it. Each takes only the options listed; anything else (`git -c`, `git diff --output`,
+# `--ext-diff`, `tar --remove-files`, `--to-command`, `-C`, `-g`, ...) is not one of these shapes.
+_GIT_GLOB_READS = {
+    "add": re.compile(r"-[AuvnfN]+|--(?:all|update|verbose|dry-run|force|intent-to-add)"),
+    "diff": re.compile(r"-[wb]+|-U\d+|--(?:stat|cached|staged|name-only|name-status|numstat|shortstat"
+                       r"|no-color|color|ignore-all-space|ignore-space-change)"),
+    "status": re.compile(r"-[sbu]+|-u(?:no|normal|all)|--(?:short|branch|porcelain(?:=v[12])?|ignored"
+                         r"|untracked-files(?:=(?:no|normal|all))?)"),
+}
+_TAR_LETTERS = frozenset("ctzjJvf")
+_TAR_LONG = frozenset(("--create", "--list", "--gzip", "--bzip2", "--xz", "--verbose"))
+
+
+def _operand_ok(word):
+    """An operand of a glob read: a glob is read, never written; a plain word must not name a rail."""
+    return bool(_GLOB_RE.search(_plain(word))) or not _mentions_rail(word)
+
+
+def _tar_is_glob_read(args):
+    """tar in create or list mode, its operands read. The -f/--file archive IS written, so it is held
+    to the write rule: it may not name, or glob to, a rail."""
+    modes, targets, operands, i, dashdash = set(), [], [], 0, False
+    while i < len(args):
+        t = args[i]
+        if dashdash or (i > 0 and not t.startswith("-")) or t == "-":
+            operands.append(t); i += 1; continue
+        if t == "--":
+            dashdash = True; i += 1; continue
+        if t.startswith("--"):
+            if t.startswith("--file="):
+                targets.append(t[7:]); i += 1; continue
+            if t == "--file":
+                if i + 1 >= len(args):
+                    return False
+                targets.append(args[i + 1]); i += 2; continue
+            if t not in _TAR_LONG:
+                return False
+            modes.add({"--create": "c", "--list": "t"}.get(t, "")); i += 1; continue
+        letters = t.lstrip("-") if t.startswith("-") else t      # `czf` and `-czf` alike
+        i += 1
+        if t.startswith("-") and "f" in letters and not letters.endswith("f"):
+            targets.append(letters[letters.index("f") + 1:])     # `-fa.tgz`: the value attached
+            letters = letters[:letters.index("f")]
+        elif "f" in letters:
+            if i >= len(args):
+                return False
+            targets.append(args[i]); i += 1
+        if not letters or not set(letters) <= _TAR_LETTERS:
+            return False
+        modes.update(letters)
+    if not modes & {"c", "t"}:
+        return False
+    return all(not _mentions_rail(a) for a in targets) and all(_operand_ok(a) for a in operands)
+
+
+def _is_glob_read(fragment):
+    """`git add *`, `git diff *`, `git status *`, `tar czf a.tgz *`: commands that only read what a
+    bare glob expands to. No wrapper, no expansion, no hidden command, no redirection; every option on
+    the list above; a plain operand naming a rail is still refused."""
+    if (_HIDDEN_COMMAND_RE.search(fragment) or _FUNCTION_DEF_RE.search(fragment)
+            or re.search(r"[<>$]", _unquoted(fragment)[0])):
+        return False
+    try:
+        argv = shlex.split(fragment)
+    except ValueError:
+        return False
+    if len(argv) >= 2 and argv[0] == "git" and argv[1] in _GIT_GLOB_READS:
+        opt, rest, dashdash = _GIT_GLOB_READS[argv[1]], argv[2:], False
+        for a in rest:
+            if a == "--" and not dashdash:
+                dashdash = True
+            elif a.startswith("-") and not dashdash:
+                if not opt.fullmatch(a):
+                    return False
+            elif not _operand_ok(a):
+                return False
+        return True
+    if argv and argv[0] == "tar":
+        return _tar_is_glob_read(argv[1:])
+    return False
 
 
 def refuse(command):
@@ -551,6 +650,6 @@ def refuse(command):
         # EVERY piece of it must be a read: an earlier piece can redefine what a read word runs.
         if any(_mentions_rail(p) and not SECRET_SAFE_RE.match(p) for p in rparts):
             for p in rparts:
-                if not (_TRUSTED_SETUP_RE.match(p) or _is_read(p)):
+                if not (_TRUSTED_SETUP_RE.match(p) or _is_read(p) or _is_glob_read(p)):
                     return _rails_refusal(cmd)
     return None

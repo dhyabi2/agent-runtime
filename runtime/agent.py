@@ -92,7 +92,7 @@ def run_tool(cmd, timeout=180):
     """The only way this agent touches the world. The guard decides first, always."""
     blocked = guard.refuse(cmd)
     if blocked:
-        emit("scope", {"decision": "refused", "command": cmd[:200], "why": blocked[:300]})
+        emit("scope", {"decision": "refused", "command": cmd[:200], "why": blocked[:600]})
         return {"ok": False, "refused": blocked}
     t0 = time.time()
     try:
