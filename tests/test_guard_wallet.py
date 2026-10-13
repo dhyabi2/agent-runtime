@@ -290,7 +290,6 @@ class TheSeedCannotLeave(unittest.TestCase):
                   "echo 'see sshd_config_notes' >> log.txt",
                   "rm /tmp/sshd_config_backup_2026.tgz",
                   "cp /etc/swarm/environment.example /tmp/x",
-                  "rm -f /opt/swarm/swarm/guard.py.orig",
                   "rm -rf /tmp/build/*.pyc", "cp *.txt /tmp/out/", "rm -f /tmp/x/{a,b}.log",
                   "git add runtime/*.py",
                   "sudo systemctl status swarm-agent@a01", "nice -n 10 python3 -m pytest tests/",
@@ -299,6 +298,49 @@ class TheSeedCannotLeave(unittest.TestCase):
                   f"sudo -n cat '{G}'", f'grep -n RAILS "{G}"', "ls /opt/swarm/swarm/*",
                   "head -5 /opt/swarm/swarm/g*.py"):
             self.assertAllowed(c)
+
+    def test_a_rail_built_inside_an_interpreter_or_behind_a_hash_is_still_a_rail(self):
+        """Reading words the way the shell does missed what the shell never sees: an interpreter
+        gluing a rail together, and shlex's default comment handling, which dropped everything after
+        a `#` in the middle of a word (`x#y`), redirect target included. All were refused on main.
+        So the old substring rule stays as a backstop, and shlex treats `#` as an ordinary character.
+        `guard.py.orig` is refused with them: it cannot be told apart from `'guard.py'.strip()`."""
+        for c in ("cat x#y > /root/.ssh/authorized_keys",
+                  "cat /tmp/new a#b > /opt/swarm/swarm/guard.py",
+                  "head -c0 x#y >/opt/swarm/swarm/guard.py",
+                  "cat a#b >/etc/ssh/sshd_config.d/z.conf",
+                  "python3 -c \"p='/root/.ssh/';open(p+'authorized_keys','a').write('k')\"",
+                  "python3 -c \"import os;os.remove('/etc/ssh/'+'sshd_config')\"",
+                  "awk 'BEGIN{print \"x\" > \"/root/.ssh/authorized_keys\"}'",
+                  "python3 -c \"open('/opt/swarm/swarm/guard.py'.strip(),'w')\"",
+                  "node -e \"require('fs').unlinkSync('/etc/ssh/sshd_config'+'')\"",
+                  "sort -oauthorized_keys k",
+                  "rm -f /opt/swarm/swarm/guard.py.orig",
+                  "# a comment first\nrm /opt/swarm/swarm/guard.py",
+                  "cd /etc/ssh && rm -f s*", "rm -rf /etc/ssh/*", "rm ~/.ssh/a*", "rm .ssh/*",
+                  "rm -rf */*", "rm ./*", "rm -rf build/../../etc/ssh/*", "rm /opt/swarm/swarm/*.py"):
+            self.assertRefused(c)
+
+    def test_a_glob_under_an_ordinary_directory_is_ordinary_work(self):
+        """`build/*` could only reach a sshd_config that sits in build/, which is not the rail, and
+        refusing it stops a coding agent from cleaning a build. A real comment that merely mentions
+        a rail is not a command."""
+        for c in ("rm -rf build/*", "pytest tests/*", "git add src/*", "cp -r src/* dist/",
+                  "chmod +x scripts/*", "tar czf r.tgz dist/*", "npx eslint src/**/*.js",
+                  "# keep sshd_config untouched\nnpm test",
+                  "npm test # never touch authorized_keys"):
+            self.assertAllowed(c)
+
+    def test_a_word_of_stars_cannot_hang_the_guard(self):
+        """A glob turned into a regex backtracked exponentially: 32 stars took 34 seconds, on any
+        command. Globs are now matched without backtracking."""
+        import time
+        t = time.time()
+        for c in ("ls " + "*" * 40 + "Q", "rm " + "*?" * 40 + "Q", "echo " + "a*" * 200 + "Q",
+                  "rm " + "x/" * 400 + "*", "echo " + "a" * 70000 + " sshd_config"):
+            guard.refuse(c)
+        self.assertLess(time.time() - t, 5)
+        self.assertTrue(guard.refuse("rm " + "x" * 70000 + " /opt/swarm/swarm/guard.py"))
 
     def test_ordinary_work_is_untouched(self):
         """A lock that blocks the job is not a lock, it is an outage."""

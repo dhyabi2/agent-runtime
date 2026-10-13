@@ -51,6 +51,13 @@ X_POST_RE = re.compile(r"\brai-x\b|api\.(?:twitter|x)\.com|\b(?:tweet|post-newsl
 # and `gu\ard.py` are. sshd_config.d is included by sshd_config, and sshd reads authorized_keys2.
 RAIL_PATHS = ("swarm/guard.py", "etc/swarm/env", ".swarm/wallet.json",
               "sshd_config", "sshd_config.d", "authorized_keys", "authorized_keys2")
+# The backstop: a rail name anywhere in the text, glued to anything but a name character. An
+# interpreter builds paths the shell never sees (`'/etc/ssh/'+'sshd_config'`, `'...guard.py'.strip()`),
+# so a non-read command that so much as spells a rail is a rail command. `sshd_config_notes` is not.
+RAILS_RE = re.compile(
+    r"(?:/swarm/guard\.py|/etc/swarm/env|\.swarm/wallet\.json"
+    r"|(?<![A-Za-z0-9_-])(?:sshd_config|authorized_keys))(?![A-Za-z0-9_-])")
+_MAX_RAIL_SCAN = 65536      # past this the word-by-word reading is skipped and only the backstop runs
 _SPLIT = re.compile(r"&&|\|\||;|\||\n")
 
 # The rails fail CLOSED, like the seed and the env below, and for the reason this file already
@@ -333,26 +340,54 @@ def _brace_expand(word, budget=64):
     return [word]
 
 
-def _glob_re(glob):
-    """A shell glob as a regex: `*` and `?` stay inside one component, `**` crosses them, and a
-    bracket class becomes any one character (wider than the class, never narrower)."""
-    out, i = [], 0
+def _glob_tokens(glob):
+    """A shell glob as tokens: `*` and `?` stay inside one component, `**` (any run of stars) crosses
+    them, and a bracket class becomes any one character (wider than the class, never narrower)."""
+    toks, i = [], 0
     while i < len(glob):
-        if glob.startswith("**/", i):
-            out.append("(?:.*/)?"); i += 3; continue
         if glob.startswith("**", i):
-            out.append(".*"); i += 2; continue
+            while i < len(glob) and glob[i] == "*":
+                i += 1
+            if glob.startswith("/", i):
+                toks.append("**/"); i += 1
+            else:
+                toks.append("**")
+            continue
         c = glob[i]
-        if c == "*":
-            out.append("[^/]*")
-        elif c == "?":
-            out.append("[^/]")
-        elif c == "[" and glob.find("]", i + 2) != -1:
-            out.append("[^/]"); i = glob.find("]", i + 2)
-        else:
-            out.append(re.escape(c))
-        i += 1
-    return re.compile("".join(out))
+        if c == "[" and glob.find("]", i + 2) != -1:
+            toks.append("?"); i = glob.find("]", i + 2) + 1; continue
+        toks.append(c if c in "*?" else "=" + c); i += 1
+    return toks
+
+
+def _glob_matches(glob, s):
+    """Whether the glob matches all of `s`, as a set of reachable positions: no backtracking, so a
+    word of a thousand stars costs a thousand steps, not forever."""
+    cur = {0}
+    for t in _glob_tokens(glob):
+        nxt = set()
+        for p in cur:
+            if t == "**":
+                nxt.update(range(p, len(s) + 1))
+            elif t == "**/":
+                nxt.add(p); nxt.update(q + 1 for q in range(p, len(s)) if s[q] == "/")
+            elif t == "*":
+                q = p; nxt.add(q)
+                while q < len(s) and s[q] != "/":
+                    q += 1; nxt.add(q)
+            elif t == "?":
+                if p < len(s) and s[p] != "/":
+                    nxt.add(p + 1)
+            elif p < len(s) and s[p] == t[1]:
+                nxt.add(p + 1)
+        if not nxt:
+            return False
+        cur = nxt
+    return len(s) in cur
+
+
+# A glob straight under one of these may be in the ssh directory itself, so it can reach sshd_config.
+_SSH_DIRS = frozenset(("", ".", "..", "~", "ssh", ".ssh", "sshd_config.d"))
 
 
 def _path_is_rail(path):
@@ -365,9 +400,16 @@ def _path_is_rail(path):
         comps = p.split("/")
         for i in range(len(comps)):
             for j in range(i + 1, min(i + _RAIL_DEPTH, len(comps)) + 1):
-                rx = _glob_re("/".join(comps[i:j]))
-                if any(rx.fullmatch(r) for r in RAIL_PATHS):
-                    return True
+                sub = "/".join(comps[i:j])
+                # `build/*` would only reach a sshd_config that sits in build/, which is not a rail;
+                # `build/**` is `build` itself, whose subtree this guard does not track either.
+                under_plain_dir = (j == i + 1 and i > 0 and _GLOB_RE.search(sub)
+                                   and not _GLOB_RE.search(comps[i - 1]) and comps[i - 1] not in _SSH_DIRS)
+                for r in RAIL_PATHS:
+                    if under_plain_dir and ("/" not in r or "**" in sub):
+                        continue
+                    if _glob_matches(sub, r):
+                        return True
     return False
 
 
@@ -375,21 +417,58 @@ def _names_rail(text):
     """True if any word in `text` is, or could expand to, a rail path. When unsure, it does."""
     if _ANSI_C_ESCAPE_RE.search(text):
         return True
-    for word in _WORD_SPLIT_RE.split(_plain(text)):
+    words = _WORD_SPLIT_RE.split(_plain(text))
+    # `-oauthorized_keys`: a short option with its value attached names the value too.
+    words += [w[2:] for w in words if len(w) > 2 and w[0] == "-" and w[1] != "-"]
+    for word in words:
         for expanded in _brace_expand(word):
             if any(piece and _path_is_rail(piece) for piece in expanded.split(",")):
                 return True
     return False
 
 
+def _mentions_rail(text):
+    """The backstop, then (for text of a sane size) the word-by-word reading."""
+    return bool(RAILS_RE.search(text)) or (len(text) <= _MAX_RAIL_SCAN and _names_rail(text))
+
+
+def _strip_comments(cmd):
+    """Drop real shell comments: an unquoted `#` that starts a word, to the end of its line. Not
+    through shlex's commenters, which also cut at a `#` inside a word (`x#y`). A here-document
+    body is not shell, so a command with one keeps every line."""
+    if "<<" in cmd:
+        return cmd
+    out, i, q, n = [], 0, None, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if q:
+            if c == "\\" and q == '"' and i + 1 < n:
+                out.append(cmd[i:i + 2]); i += 2; continue
+            q = None if c == q else q
+        elif c == "\\" and i + 1 < n:
+            out.append(cmd[i:i + 2]); i += 2; continue
+        elif c in "'\"":
+            q = c
+        elif c == "#" and (not out or out[-1] in " \t\n;&|()"):
+            while i < n and cmd[i] != "\n":
+                i += 1
+            continue
+        out.append(c); i += 1
+    return "".join(out)
+
+
 def _writes_to_rail(fragment):
     """True if a redirection in `fragment` targets a rail, however the target is quoted. A fragment
-    shlex cannot tokenise counts as one."""
+    shlex cannot tokenise, or tokenises into anything but its own characters, counts as one."""
     try:
         lex = shlex.shlex(fragment, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
+        lex.commenters = ""                   # `x#y` is a word, not the start of a comment
         tokens = list(lex)
     except ValueError:
+        return True
+    squash = lambda t: re.sub(r"[\s'\"\\]", "", t)
+    if squash("".join(tokens)) != squash(fragment):
         return True
     return any(_REDIRECT_OP_RE.match(t) and _names_rail(nxt) for t, nxt in zip(tokens, tokens[1:]))
 
@@ -443,8 +522,9 @@ def refuse(command):
                 "one place a mistake cannot be taken back. Record the result in the journal instead — the "
                 "live map publishes it, and the swarm's other agents can post it once it is proven.")
 
-    if _names_rail(cmd):
-        if _writes_to_rail(cmd):
+    cmd = _strip_comments(cmd)
+    if _mentions_rail(cmd):
+        if len(cmd) > _MAX_RAIL_SCAN or _writes_to_rail(cmd):
             return RAILS_REFUSAL
         rparts = _split_unquoted(cmd)
         if rparts is None:
@@ -453,7 +533,7 @@ def refuse(command):
         # The secret path above permits exactly that shape, so a command whose only mention of a
         # rail is that sourcing is not a rail command. Any other mention makes it one, and then
         # EVERY piece of it must be a read: an earlier piece can redefine what a read word runs.
-        if any(_names_rail(p) and not SECRET_SAFE_RE.match(p) for p in rparts):
+        if any(_mentions_rail(p) and not SECRET_SAFE_RE.match(p) for p in rparts):
             for p in rparts:
                 if not (_TRUSTED_SETUP_RE.match(p) or _is_read(p)):
                     return RAILS_REFUSAL
