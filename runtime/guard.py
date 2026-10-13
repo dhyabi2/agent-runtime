@@ -390,11 +390,11 @@ def _glob_matches(glob, s):
 _SSH_DIRS = frozenset(("", ".", "..", "~", "ssh", ".ssh", "sshd_config.d"))
 
 
-def _path_is_rail(path):
+def _path_is_rail(path, rails=RAIL_PATHS):
     """True if `path`, or any file a glob in it could expand to, contains a rail's components."""
     for p in {path, posixpath.normpath(path)}:
         if not _GLOB_RE.search(p):
-            if any(f"/{r}/" in f"/{p}/" for r in RAIL_PATHS):
+            if any(f"/{r}/" in f"/{p}/" for r in rails):
                 return True
             continue
         comps = p.split("/")
@@ -405,7 +405,7 @@ def _path_is_rail(path):
                 # `build/**` is `build` itself, whose subtree this guard does not track either.
                 under_plain_dir = (j == i + 1 and i > 0 and _GLOB_RE.search(sub)
                                    and not _GLOB_RE.search(comps[i - 1]) and comps[i - 1] not in _SSH_DIRS)
-                for r in RAIL_PATHS:
+                for r in rails:
                     if under_plain_dir and ("/" not in r or "**" in sub):
                         continue
                     if _glob_matches(sub, r):
@@ -413,18 +413,30 @@ def _path_is_rail(path):
     return False
 
 
-def _names_rail(text):
+def _names_rail(text, rails=RAIL_PATHS):
     """True if any word in `text` is, or could expand to, a rail path. When unsure, it does."""
-    if _ANSI_C_ESCAPE_RE.search(text):
+    if rails is RAIL_PATHS and _ANSI_C_ESCAPE_RE.search(text):
         return True
     words = _WORD_SPLIT_RE.split(_plain(text))
     # `-oauthorized_keys`: a short option with its value attached names the value too.
     words += [w[2:] for w in words if len(w) > 2 and w[0] == "-" and w[1] != "-"]
     for word in words:
         for expanded in _brace_expand(word):
-            if any(piece and _path_is_rail(piece) for piece in expanded.split(",")):
+            if any(piece and _path_is_rail(piece, rails) for piece in expanded.split(",")):
                 return True
     return False
+
+
+# The seed and the env as whole path components, so a glob or a brace that could expand to one names
+# it: `~/.swarm/wallet.jso?`, `/root/.swarm/*`, `/etc/swarm/en?`, and `.swarm/*` run from /root.
+# ENV_PATH_RE reads only the literal spelling; this reads every spelling the shell could expand.
+SECRET_PATHS = ("etc/swarm/env", ".swarm/env", ".swarm/wallet.json")
+
+
+def _names_secret(text):
+    """True if `text` names, or could glob or brace-expand to, the seed or the env."""
+    return bool(ENV_PATH_RE.search(text) or ENV_PATH_RE.search(_plain(text))
+                or _names_rail(text, SECRET_PATHS))
 
 
 def _mentions_rail(text):
@@ -525,11 +537,14 @@ _GIT_GLOB_READS = {
                          r"|untracked-files(?:=(?:no|normal|all))?)"),
 }
 _TAR_LETTERS = frozenset("ctzjJvf")
-_TAR_LONG = frozenset(("--create", "--list", "--gzip", "--bzip2", "--xz", "--verbose"))
+_TAR_LONG = frozenset(("--create", "--list", "--gzip", "--bzip2", "--xz", "--verbose", "--exclude-vcs"))
 
 
 def _operand_ok(word):
-    """An operand of a glob read: a glob is read, never written; a plain word must not name a rail."""
+    """An operand of a glob read: a glob is read, never written, so it may reach a rail, but never
+    the seed or the env, which are not even read out; a plain word must not name a rail."""
+    if _names_secret(word):
+        return False
     return bool(_GLOB_RE.search(_plain(word))) or not _mentions_rail(word)
 
 
@@ -550,6 +565,8 @@ def _tar_is_glob_read(args):
                 if i + 1 >= len(args):
                     return False
                 targets.append(args[i + 1]); i += 2; continue
+            if t.startswith("--exclude=") and len(t) > 10:
+                i += 1; continue                                  # only narrows what is read
             if t not in _TAR_LONG:
                 return False
             modes.add({"--create": "c", "--list": "t"}.get(t, "")); i += 1; continue
@@ -615,10 +632,14 @@ def refuse(command):
         return "Blocked: that dumps every variable, keys included. Keys are used by programs, never printed."
     # The seed and the env fail CLOSED: it is not enough to list the programs that may not read them,
     # because the list will always be missing one. Here it was every editor.
-    # Matched with the quoting undone too: `cat "/root/.swarm/"wallet.json` is the same file.
-    if any(SECRET_VAR_RE.search(t) or ENV_PATH_RE.search(t) for t in (cmd, _plain(cmd))):
+    # Matched with the quoting undone too: `cat "/root/.swarm/"wallet.json` is the same file, and
+    # through any glob or brace: `cat /root/.swarm/*` reads the seed as surely as naming it.
+    # Past _MAX_RAIL_SCAN the word-by-word reading is skipped; such a command is refused below anyway.
+    names_secret = lambda t: (SECRET_VAR_RE.search(t) or SECRET_VAR_RE.search(_plain(t))
+                              or (_names_secret(t) if len(t) <= _MAX_RAIL_SCAN else ENV_PATH_RE.search(_plain(t))))
+    if names_secret(cmd):
         for p in parts:
-            if not any(SECRET_VAR_RE.search(t) or ENV_PATH_RE.search(t) for t in (p, _plain(p))):
+            if not names_secret(p):
                 continue                      # this fragment does not name a secret; it is not the issue
             if SECRET_SAFE_RE.match(p):
                 continue                      # loading the env for the program that follows is fine

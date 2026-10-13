@@ -75,8 +75,9 @@ failing **closed** on anything naming a credential.
 A bare `*` or `?` glob (a whole path component, as in `rm *` or `rm -rf */__pycache__`) in a command
 that writes is refused: the guard cannot know the working directory, so it cannot rule out that the
 glob expands to `sshd_config` or `authorized_keys`. Name the files, or give the glob a directory
-prefix (`rm -rf build/*`). Commands that only read what the glob matches (`git add *`, `tar czf a.tgz *`)
-are not affected.
+prefix (`rm -rf build/*`). A command that only reads what the glob matches (`git add *`,
+`tar czf a.tgz *`) is allowed on its own, but every piece of a command must be a read, so
+`git add * && git commit -m x` is still refused: use `git add -A && git commit -m x` instead.
 
 ## Using it
 

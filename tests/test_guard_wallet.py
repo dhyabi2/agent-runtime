@@ -373,6 +373,27 @@ class TheSeedCannotLeave(unittest.TestCase):
         self.assertTrue(r)
         self.assertNotIn("glob was the trigger", r)
 
+    def test_a_glob_that_could_reach_the_seed_or_the_env_is_the_seed_or_the_env(self):
+        """ENV_PATH_RE read only the literal path, so `cat /root/.swarm/*` read the seed, and the
+        glob reads let `git add`/`tar` carry it into a commit or an archive."""
+        for c in ("git add ~/.swarm/wallet.jso?", "git add /root/.swarm/*", "tar czf a.tgz ~/.swarm/*",
+                  "tar czf a.tgz /root/.swarm/wallet.js*", "tar czf a.tgz /etc/swarm/en?",
+                  "git add -f .swarm/*", "tar czf a.tgz .swarm/*", "cat ~/.swarm/wallet.jso?",
+                  "cat /root/.swarm/*", "cat /root/.swarm/wallet.{json,x}", "cat /etc/swarm/e[n]v"):
+            self.assertRefused(c)
+            self.assertIn("keys and seeds", guard.refuse(c))
+        for c in ("cat README.md", "ls *", "git add *", ". /etc/swarm/env && python3 x.py"):
+            self.assertAllowed(c)
+
+    def test_tar_may_exclude(self):
+        self.assertAllowed("tar czf a.tgz --exclude=node_modules *")
+        self.assertAllowed("tar czf a.tgz --exclude-vcs *")
+
+    def test_a_glob_read_followed_by_a_write_is_still_refused(self):
+        """Every piece must be a read: the README says so and offers `git add -A` instead."""
+        self.assertRefused("git add * && git commit -m x")
+        self.assertAllowed("git add -A && git commit -m x")
+
     def test_the_too_long_refusal_says_how(self):
         self.assertIn(">>", guard.refuse("echo " + "x" * 70000))
 
