@@ -79,8 +79,10 @@ prefix (`rm -rf build/*`). A command that only reads what the glob matches (`git
 `tar czf a.tgz *`) is allowed on its own, but every piece of a command must be a read, so
 `git add * && git commit -m x` is still refused: use `git add -A && git commit -m x` instead.
 A glob that could reach the seed or env path is refused even when your shell would not expand it
-there (`cat */env` without dotglob, say); name the path instead. `agent.py` turns dotglob, extglob,
-globstar and nocaseglob off (and unsets `GLOBIGNORE` and `BASH_ENV`) before every command it runs.
+there (`cat */env` without dotglob, say); name the path instead.
+A bare `*`/`?` with no directory is refused because the guard cannot know the working directory, and
+`./*` is no way round it (`.` could be `/etc/ssh` as well): name the files you mean explicitly, as the
+refusal says.
 
 ## Using it
 

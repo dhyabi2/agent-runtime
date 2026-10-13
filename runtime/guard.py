@@ -178,6 +178,82 @@ def _unquoted(fragment):
     return "".join(expands), "".join(bare)
 
 
+# A glob character that is text, not a pattern: in a quoted string with a space in it (a commit
+# message, `print(2 * 3)`, `SELECT * FROM`), backslash-escaped as a word of its own (`expr 2 \* 3`),
+# in a here-document body, or in `$(( ))` arithmetic. Bash globs none of these. A quoted or escaped
+# glob with no space round it is still read as a pattern, because programs glob their arguments
+# themselves: `find / -name 'sshd*' -delete`, `git add '*.py'`.
+_GLOB_CHARS = "*?[]"
+_LITERAL = "\x01"
+_SUBST_RE = re.compile(r"\$\(|`")
+_HEREDOC_RE = re.compile(r"<<(-?)[ \t]*((?:[^\s;&|<>()]|\\.)+)")
+
+
+def _literal_globs(text):
+    """`text` with every glob character that is text rather than a pattern replaced by _LITERAL.
+    Quotes are kept, so a quoted rail or secret path still reads as that path once the quoting is
+    undone; only what its glob characters can match changes."""
+    lit = lambda seg: "".join(_LITERAL if ch in _GLOB_CHARS else ch for ch in seg)
+    out, i, n, heredocs = [], 0, len(text), []
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            alone = ((i == 0 or text[i - 1] in " \t\n") and
+                     (i + 2 >= n or text[i + 2] in " \t\n;&|)"))
+            out.append(_LITERAL if text[i + 1] in _GLOB_CHARS and alone else text[i:i + 2])
+            i += 2; continue
+        if c in "'\"":
+            k = i + 1
+            while k < n and text[k] != c:
+                k += 2 if c == '"' and text[k] == "\\" else 1
+            seg = text[i:k + 1]
+            text_only = re.search(r"\s", seg) and (c == "'" or not _SUBST_RE.search(seg))
+            out.append(lit(seg) if text_only else seg)
+            i = k + 1; continue
+        if text.startswith("$((", i):
+            depth, k = 0, i + 1
+            while k < n:
+                depth += {"(": 1, ")": -1}.get(text[k], 0)
+                k += 1
+                if depth == 0:
+                    break
+            seg = text[i:k]
+            out.append(seg if _SUBST_RE.search(seg[3:]) else lit(seg)); i = k; continue
+        if text.startswith(("((", "$["), i):
+            # `((x<<2))` and `$[1<<2]` shift; they open no here-document, so nothing after them
+            # may be read as one. Kept as written: a glob in them stays a glob.
+            close = "))" if c == "(" else "]"
+            k = text.find(close, i + 2)
+            k = n if k == -1 else k + len(close)
+            out.append(text[i:k]); i = k; continue
+        m = _HEREDOC_RE.match(text, i) if c == "<" and not text.startswith("<<<", i) else None
+        if m:
+            heredocs.append((m.group(1) == "-", re.sub(r"['\"\\]", "", m.group(2)),
+                             not re.search(r"['\"\\]", m.group(2))))
+            out.append(m.group(0)); i = m.end(); continue
+        if c == "\n" and heredocs:
+            out.append(c); i += 1
+            for strip_tabs, delim, expands in heredocs:   # the bodies follow in order
+                body, close = [], ""
+                while i < n:
+                    end = text.find("\n", i)
+                    end = n if end == -1 else end + 1
+                    line = text[i:end]
+                    i = end
+                    last = line.rstrip("\n")
+                    if (last.lstrip("\t") if strip_tabs else last) == delim:
+                        close = line; break
+                    body.append(line)
+                body = "".join(body)
+                # An unquoted delimiter runs `$(...)` in the body, and a glob in that command globs.
+                out.append(body if expands and _SUBST_RE.search(body) else lit(body))
+                out.append(close)
+            heredocs = []
+            continue
+        out.append(c); i += 1
+    return "".join(out)
+
+
 def _peel(argv):
     """Strip permitted wrappers off the front of argv. Returns (argv, peeled_any) or None."""
     peeled = False
@@ -390,6 +466,68 @@ def _glob_matches(glob, s):
 _SSH_DIRS = frozenset(("", ".", "..", "~", "ssh", ".ssh", "sshd_config.d"))
 
 
+_DIR_RAILS = {"sshd_config.d": ".conf"}       # a rail that is a directory: sshd includes its *.conf
+
+
+def _own_final(comps):
+    """The glob for a word's last path component. A `**` glued inside it (from a brace too wide to
+    expand) can cross components, so only what follows the last one is the component's own."""
+    last = comps[-1]
+    return "*" + last[last.rindex("**") + 2:] if "**" in last else last
+
+
+def _could_be_included(comps, suffix):
+    """Whether the word's last component could name a file the rail directory's owner reads from it:
+    sshd includes only `sshd_config.d/*.conf`, so `**/__pycache__` and `**/*.py` cannot be one."""
+    toks = _glob_tokens(_own_final(comps))
+    k = len(toks)
+    while k and toks[k - 1].startswith("="):
+        k -= 1
+    tail = "".join(t[1] for t in toks[k:])
+    return tail.endswith(suffix) or suffix.endswith(tail)
+
+
+def _final_could_reach(comps, rails):
+    """Whether a glob whose components are `comps` could end on a rail, or inside a rail directory.
+    `**/__pycache__` cannot: no `__pycache__` is named env, sshd_config or guard.py, and sshd reads
+    nothing but `*.conf` from sshd_config.d."""
+    if comps[-1] in ("", ".", ".."):
+        return True                                   # the word names a directory: anything below
+    last = _own_final(comps)
+    if any(_glob_matches(last, r.rsplit("/", 1)[-1]) for r in rails):
+        return True
+    for d, suffix in _DIR_RAILS.items():
+        if not any(d == r.rsplit("/", 1)[-1] for r in rails):
+            continue
+        if _could_be_included(comps, suffix):
+            return True
+        if any("**" not in c and _glob_matches(c, d) for c in comps[:-1]):
+            return True                               # the directory itself is named on the way
+    return False
+
+
+_EXTENSION_GLOB_RE = re.compile(r"\*\.[^*?\[\]{}]+")
+
+
+def _rail_dir_by_named(sub, rail):
+    """True when a run of glob components could match the rail `swarm/guard.py` only by letting a
+    whole `**` stand for the rail's own directory, and the file is matched only by its extension:
+    `**/*.py`, `src/**/*.py`. That is a tool run over the tree being worked on, not an aim at the
+    runtime's checkout. Naming the file (`/opt/**/guard.py`), naming or globbing its directory
+    (`swarm/*.py`, `*/guard.py`) or `swarm/**` still reaches it. A `**` glued inside a component
+    (from a brace too wide to expand) may cross components, so it is not judged here."""
+    if not _EXTENSION_GLOB_RE.fullmatch(sub[-1]) or any("**" in c and c != "**" for c in sub):
+        return False
+
+    def match(si, ri):
+        if si == len(sub):
+            return ri == len(rail)
+        if sub[si] == "**":
+            return match(si + 1, ri) or (ri == len(rail) - 1 and match(si + 1, ri + 1))
+        return ri < len(rail) and _glob_matches(sub[si], rail[ri]) and match(si + 1, ri + 1)
+    return not match(0, 0)
+
+
 def _path_is_rail(path, rails=RAIL_PATHS):
     """True if `path`, or any file a glob in it could expand to, contains a rail's components."""
     for p in {path, posixpath.normpath(path)}:
@@ -398,6 +536,11 @@ def _path_is_rail(path, rails=RAIL_PATHS):
                 return True
             continue
         comps = p.split("/")
+        if not _final_could_reach(comps, rails):
+            continue
+        end = len(comps)                  # past `end` only `x/`, `x/.` or `x/..`: x is the last name
+        while end > 1 and comps[end - 1] in ("", ".", ".."):
+            end -= 1
         for i in range(len(comps)):
             for j in range(i + 1, min(i + _RAIL_DEPTH, len(comps)) + 1):
                 sub = "/".join(comps[i:j])
@@ -408,18 +551,32 @@ def _path_is_rail(path, rails=RAIL_PATHS):
                 for r in rails:
                     if under_plain_dir and ("/" not in r or "**" in sub):
                         continue
+                    if j < end:           # a name with more path after it is a directory, not a file
+                        suffix = _DIR_RAILS.get(r.rsplit("/", 1)[-1])
+                        if suffix is None or ("**" in comps[i:j] and not _could_be_included(comps, suffix)):
+                            continue
+                    if rails is RAIL_PATHS and "/" in r and _rail_dir_by_named(comps[i:j], r.split("/")):
+                        continue
                     if _glob_matches(sub, r):
                         return True
     return False
+
+
+def _path_words(text):
+    """The words of `text` a path could be, quoting undone. A glob character bash would not glob is
+    a literal (`"done *"`, `expr 2 \\* 3`), except in a word that is a path: an interpreter globs
+    `'/etc/ssh/*'` itself, so a quoted glob in a word with a `/` still reads as a glob."""
+    words = _WORD_SPLIT_RE.split(_plain(_literal_globs(text)))
+    words = [w.replace(_LITERAL, "*") if "/" in w else w for w in words]
+    # `-oauthorized_keys`: a short option with its value attached names the value too.
+    return words + [w[2:] for w in words if len(w) > 2 and w[0] == "-" and w[1] != "-"]
 
 
 def _names_rail(text, rails=RAIL_PATHS):
     """True if any word in `text` is, or could expand to, a rail path. When unsure, it does."""
     if rails is RAIL_PATHS and _ANSI_C_ESCAPE_RE.search(text):
         return True
-    words = _WORD_SPLIT_RE.split(_plain(text))
-    # `-oauthorized_keys`: a short option with its value attached names the value too.
-    words += [w[2:] for w in words if len(w) > 2 and w[0] == "-" and w[1] != "-"]
+    words = _path_words(text)
     for word in words:
         for expanded in _brace_expand(word):
             if any(piece and _path_is_rail(piece, rails) for piece in expanded.split(",")):
@@ -433,10 +590,40 @@ def _names_rail(text, rails=RAIL_PATHS):
 SECRET_PATHS = ("etc/swarm/env", ".swarm/env", ".swarm/wallet.json")
 
 
+# The directories that hold them: `tar czf x.tgz ~/.swarm` and `cp -r /etc/swarm out` carry the seed
+# and the env without naming either file.
+SECRET_DIRS = tuple(sorted({posixpath.dirname(p) for p in SECRET_PATHS}))
+
+
+def _names_secret_dir(text):
+    """True if a word in `text` is, or could glob or brace-expand to, a directory that holds the
+    seed or the env: `~/.swarm`, `~/.swarm/`, `"$HOME"/.swarm`, `/etc/swarm`, `/etc/swar?`.
+
+    A glob here reads the way default bash globs: `*`, `?` and `**` do not match a leading dot, so
+    `ls *` and `git add *` do not reach ~/.swarm. A word with a brace is read without that rule,
+    because a brace too wide to expand became `**`, and a brace's alternative may start with a dot."""
+    for word in _path_words(text):
+        dot_rule = "{" not in word
+        for expanded in _brace_expand(word):
+            for piece in expanded.split(","):
+                comps = posixpath.normpath(piece).split("/") if piece else []
+                for d in SECRET_DIRS:
+                    dc = d.split("/")
+                    if len(comps) >= len(dc) and all(
+                            _glob_matches(g, x) and not (dot_rule and x[0] == "." and g[:1] != ".")
+                            for g, x in zip(comps[-len(dc):], dc)):
+                        return True
+                    if "**" in piece and not (dot_rule and d.startswith(".")):
+                        if any(_glob_matches("/".join(comps[k:]), d) for k in range(len(comps))):
+                            return True       # a `**` can stand for more than one component
+    return False
+
+
 def _names_secret(text):
-    """True if `text` names, or could glob or brace-expand to, the seed or the env."""
+    """True if `text` names, or could glob or brace-expand to, the seed or the env, or the directory
+    that holds one."""
     return bool(ENV_PATH_RE.search(text) or ENV_PATH_RE.search(_plain(text))
-                or _names_rail(text, SECRET_PATHS))
+                or _names_rail(text, SECRET_PATHS) or _names_secret_dir(text))
 
 
 def _mentions_rail(text):

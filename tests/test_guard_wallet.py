@@ -394,19 +394,54 @@ class TheSeedCannotLeave(unittest.TestCase):
         self.assertRefused("git add * && git commit -m x")
         self.assertAllowed("git add -A && git commit -m x")
 
-    def test_every_command_starts_with_default_globbing(self):
-        """A login shell reads profiles; one that set dotglob would let `*/env` reach ~/.swarm/env."""
-        import subprocess, tempfile
+    def test_the_runner_hands_bash_the_command_as_written(self):
+        """A GLOB_RESET prefix broke scripts that relied on BASH_ENV or a profile's globstar, and the
+        guard reads globs without it, so agent.py runs exactly the command the guard checked."""
+        import inspect
         import agent
-        with tempfile.TemporaryDirectory() as d:
-            os.makedirs(os.path.join(d, ".swarm"))
-            os.makedirs(os.path.join(d, "cfg"))
-            for f in (".swarm/env", "cfg/env"):
-                open(os.path.join(d, f), "w").close()
-            out = subprocess.run(["bash", "-c", "shopt -s dotglob extglob\n" + agent.GLOB_RESET + "echo */env"],
-                                 cwd=d, capture_output=True, text=True).stdout.split()
-        self.assertEqual(out, ["cfg/env"])
-        self.assertNotIn(" ENV", agent.GLOB_RESET)     # ENV=production is an app's own variable
+        self.assertFalse(hasattr(agent, "GLOB_RESET"))
+        self.assertIn('["bash", "-lc", cmd]', inspect.getsource(agent.run_tool))
+
+    def test_a_glob_character_that_is_text_is_not_a_glob(self):
+        """Quoted text, an escaped `\\*`, a here-document body and arithmetic glob nothing, but each
+        `*` was read as a bare glob that could be sshd_config, so a commit message was refused."""
+        for c in ('git commit -m "fix: handle * in input"', 'echo "done *"', 'python3 -c "print(2 * 3)"',
+                  "echo $((2 * 3))", "expr 2 \\* 3", 'sqlite3 db "SELECT * FROM users"',
+                  "cat > a.py <<'EOF'\ndef area(w, h):\n    return w * h\nfrom os import *\nEOF",
+                  "cat <<-EOF > notes.txt\n\tx * y\n\tEOF\necho done"):
+            self.assertAllowed(c)
+        # Quoting still spells the same path, and text that bash does glob is still a glob.
+        for c in ('rm -f "/etc/ssh/"sshd_conf"ig"', 'cat "$HOME/.swarm/wallet.json"',
+                  "cat <<EOF > /etc/ssh/sshd_config\nx\nEOF", "cat > a.txt <<'EOF'\n*\nEOF\nrm *",
+                  'echo "now $(rm *)"', "cat <<EOF\n$(rm *)\nEOF", "((a = 1 << 2))\nrm *",
+                  "find / -name 'sshd*' -delete",
+                  "python3 -c \"import glob, os; [os.remove(f) for f in glob.glob('/etc/ssh/*')]\""):
+            self.assertRefused(c)
+
+    def test_a_double_star_reaches_only_what_its_last_component_can_name(self):
+        """`**` made every word look able to reach the seed, the env and the rails, whatever followed
+        it. A tool run over the tree is ordinary work; a glob that can end on a rail or a secret is not."""
+        for c in ("ls **/*.py", "rm -rf **/__pycache__", "black **/*.py", "mypy src/**/*.py"):
+            self.assertAllowed(c)
+        for c in ("cat */env", "cat **/env", "cat ~/.swarm/wallet.jso?", "git add ~/.swarm/*",
+                  "rm -rf **/sshd_config", "rm -rf **/*.conf", "rm /opt/**/guard.py",
+                  "rm -rf /opt/swarm/swarm/**", "rm -rf /etc/ssh/*/.."):
+            self.assertRefused(c)
+
+    def test_the_directory_that_holds_a_secret_is_the_secret(self):
+        """`tar czf x.tgz ~/.swarm` archived the seed without naming wallet.json."""
+        for c in ("tar czf x.tgz ~/.swarm", "tar czf x.tgz ~/.swarm/", "cp -r ~/.swarm /tmp/x",
+                  "zip -r x.zip ~/.swarm", "rsync -a ~/.swarm/ out/", "git add ~/.swarm",
+                  "tar czf x.tgz /etc/swarm", "cp -r /etc/swarm out", 'tar czf x.tgz "$HOME/.swarm"',
+                  "tar czf x.tgz '/etc/swarm/'", "cp -r /root/.swarm/. out", "tar czf x.tgz /etc/swar?",
+                  "tar czf x.tgz ~/{.swarm,y}",
+                  "tar czf x.tgz /root/{" + ",".join(f"a{i}" for i in range(70)) + ",.swarm}"):
+            self.assertRefused(c)
+            self.assertIn("keys and seeds", guard.refuse(c))
+        self.assertEqual(guard.SECRET_DIRS, (".swarm", "etc/swarm"))
+        for c in ("ls ~/swarm", "ls ~/.swarmish", "git add *", "tar czf a.tgz *",
+                  ". /etc/swarm/env && python3 x.py"):
+            self.assertAllowed(c)
 
     def test_the_too_long_refusal_says_how(self):
         self.assertIn(">>", guard.refuse("echo " + "x" * 70000))
