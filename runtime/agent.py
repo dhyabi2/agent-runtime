@@ -88,6 +88,12 @@ def blocks_from(text):
     return out
 
 
+# The guard reads a glob the way default bash expands it. A login shell reads profiles, which could
+# turn on dotglob and let `*/env` reach ~/.swarm/env, so the options go back to default before the
+# command. Its own line: bash parses a whole line before running any of it, extglob included.
+GLOB_RESET = "shopt -u dotglob extglob globstar nocaseglob; unset GLOBIGNORE BASH_ENV ENV\n"
+
+
 def run_tool(cmd, timeout=180):
     """The only way this agent touches the world. The guard decides first, always."""
     blocked = guard.refuse(cmd)
@@ -96,7 +102,7 @@ def run_tool(cmd, timeout=180):
         return {"ok": False, "refused": blocked}
     t0 = time.time()
     try:
-        r = subprocess.run(["bash", "-lc", cmd], cwd=str(HOME), capture_output=True,
+        r = subprocess.run(["bash", "-lc", GLOB_RESET + cmd], cwd=str(HOME), capture_output=True,
                            text=True, timeout=timeout)
         out = (r.stdout or "") + (("\n" + r.stderr) if r.returncode else "")
         emit("tool", {"name": cmd.split()[0][:40], "exit": r.returncode,

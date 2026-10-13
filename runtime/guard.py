@@ -355,18 +355,26 @@ def _glob_tokens(glob):
             continue
         c = glob[i]
         if c == "[" and glob.find("]", i + 2) != -1:
-            toks.append("?"); i = glob.find("]", i + 2) + 1; continue
+            toks.append("["); i = glob.find("]", i + 2) + 1; continue
         toks.append(c if c in "*?" else "=" + c); i += 1
     return toks
 
 
-def _glob_matches(glob, s):
+def _glob_matches(glob, s, dots=True):
     """Whether the glob matches all of `s`, as a set of reachable positions: no backtracking, so a
-    word of a thousand stars costs a thousand steps, not forever."""
-    cur = {0}
+    word of a thousand stars costs a thousand steps, not forever.
+
+    With dots=False it globs as bash does by default: a `*` or `?` that begins a component never
+    matches a component that begins with `.`, so `*/env` cannot reach `.swarm/env`. A bracket class
+    and `**` still may (bash versions differ on `[.]`, and `**` also stands in for an over-long brace)."""
+    cur, prev = {0}, "=/"
     for t in _glob_tokens(glob):
         nxt = set()
+        starts_comp = prev in ("=/", "**/")
         for p in cur:
+            if (not dots and starts_comp and t in ("*", "?") and p < len(s) and s[p] == "."
+                    and (p == 0 or s[p - 1] == "/")):
+                continue
             if t == "**":
                 nxt.update(range(p, len(s) + 1))
             elif t == "**/":
@@ -375,14 +383,14 @@ def _glob_matches(glob, s):
                 q = p; nxt.add(q)
                 while q < len(s) and s[q] != "/":
                     q += 1; nxt.add(q)
-            elif t == "?":
+            elif t in "?[":
                 if p < len(s) and s[p] != "/":
                     nxt.add(p + 1)
             elif p < len(s) and s[p] == t[1]:
                 nxt.add(p + 1)
         if not nxt:
             return False
-        cur = nxt
+        cur, prev = nxt, t
     return len(s) in cur
 
 
@@ -390,7 +398,7 @@ def _glob_matches(glob, s):
 _SSH_DIRS = frozenset(("", ".", "..", "~", "ssh", ".ssh", "sshd_config.d"))
 
 
-def _path_is_rail(path, rails=RAIL_PATHS):
+def _path_is_rail(path, rails=RAIL_PATHS, dots=True):
     """True if `path`, or any file a glob in it could expand to, contains a rail's components."""
     for p in {path, posixpath.normpath(path)}:
         if not _GLOB_RE.search(p):
@@ -408,12 +416,12 @@ def _path_is_rail(path, rails=RAIL_PATHS):
                 for r in rails:
                     if under_plain_dir and ("/" not in r or "**" in sub):
                         continue
-                    if _glob_matches(sub, r):
+                    if _glob_matches(sub, r, dots):
                         return True
     return False
 
 
-def _names_rail(text, rails=RAIL_PATHS):
+def _names_rail(text, rails=RAIL_PATHS, dots=True):
     """True if any word in `text` is, or could expand to, a rail path. When unsure, it does."""
     if rails is RAIL_PATHS and _ANSI_C_ESCAPE_RE.search(text):
         return True
@@ -422,7 +430,7 @@ def _names_rail(text, rails=RAIL_PATHS):
     words += [w[2:] for w in words if len(w) > 2 and w[0] == "-" and w[1] != "-"]
     for word in words:
         for expanded in _brace_expand(word):
-            if any(piece and _path_is_rail(piece, rails) for piece in expanded.split(",")):
+            if any(piece and _path_is_rail(piece, rails, dots) for piece in expanded.split(",")):
                 return True
     return False
 
@@ -433,10 +441,12 @@ def _names_rail(text, rails=RAIL_PATHS):
 SECRET_PATHS = ("etc/swarm/env", ".swarm/env", ".swarm/wallet.json")
 
 
-def _names_secret(text):
-    """True if `text` names, or could glob or brace-expand to, the seed or the env."""
+def _names_secret(text, dots=True):
+    """True if `text` names, or could glob or brace-expand to, the seed or the env. dots=False reads
+    globs the way default bash does (no `*` into a dot-directory): refuse() passes it only for a
+    command every piece of which is a read, so nothing in it can change how the shell globs."""
     return bool(ENV_PATH_RE.search(text) or ENV_PATH_RE.search(_plain(text))
-                or _names_rail(text, SECRET_PATHS))
+                or _names_rail(text, SECRET_PATHS, dots))
 
 
 def _mentions_rail(text):
@@ -614,6 +624,19 @@ def _is_glob_read(fragment):
     return False
 
 
+# Shell options that change what a glob expands to. The guard reads globs the default way, so a
+# command that changes them is not run; agent.py turns them off before every command, against a
+# profile that turned them on. `shopt` with an expansion could name any of them.
+_GLOB_MODE_RE = re.compile(r"\bshopt\b[^\n;&|]*(?:\b(?:dotglob|extglob|globstar|nocaseglob)\b|[$`\\])"
+                           r"|\b(?:GLOBIGNORE|BASHOPTS)\s*=")
+# Where a pattern is not globbed by this shell: a remote shell globs with its own options, and
+# find matches `-path '*/env'` with no rule about dots, then hands what it found to -exec.
+_OTHER_GLOBBER_RE = re.compile(r"\bssh\b|-exec|-ok")
+GLOB_MODE_REFUSAL = (
+    "Blocked: that changes how the shell expands globs (dotglob, extglob, globstar, nocaseglob, "
+    "GLOBIGNORE). The guard reads globs the way bash does by default; name the files instead.")
+
+
 def refuse(command):
     """Return a refusal string, or None to allow. The refusal is shown to the agent verbatim."""
     cmd = str(command or "")
@@ -635,8 +658,18 @@ def refuse(command):
     # Matched with the quoting undone too: `cat "/root/.swarm/"wallet.json` is the same file, and
     # through any glob or brace: `cat /root/.swarm/*` reads the seed as surely as naming it.
     # Past _MAX_RAIL_SCAN the word-by-word reading is skipped; such a command is refused below anyway.
+    # A command made only of reads globs the default way (agent.py resets the options a profile
+    # could set), so its `*` does not enter a dot-directory: `ls */env` is not the env. Anything
+    # else, which could have changed the options (`eval`, `source`, ...), keeps dots matched.
+    if _GLOB_MODE_RE.search(cmd) or _GLOB_MODE_RE.search(_plain(cmd)):
+        return GLOB_MODE_REFUSAL
+    dots = True
     names_secret = lambda t: (SECRET_VAR_RE.search(t) or SECRET_VAR_RE.search(_plain(t))
-                              or (_names_secret(t) if len(t) <= _MAX_RAIL_SCAN else ENV_PATH_RE.search(_plain(t))))
+                              or (_names_secret(t, dots) if len(t) <= _MAX_RAIL_SCAN
+                                  else ENV_PATH_RE.search(_plain(t))))
+    if names_secret(cmd) and len(cmd) <= _MAX_RAIL_SCAN and not _OTHER_GLOBBER_RE.search(_plain(cmd)):
+        rp = _split_unquoted(_strip_comments(cmd))
+        dots = not (rp and all(_TRUSTED_SETUP_RE.match(p) or _is_read(p) or _is_glob_read(p) for p in rp))
     if names_secret(cmd):
         for p in parts:
             if not names_secret(p):
@@ -645,7 +678,8 @@ def refuse(command):
                 continue                      # loading the env for the program that follows is fine
             return ("Blocked: keys and seeds are used by programs, never printed, copied, opened in an "
                     "editor, or passed to an interpreter. Pass it to the program that needs it; do not "
-                    "read it out, move it, or send it anywhere.")
+                    "read it out, move it, or send it anywhere. A glob or brace that could expand to the "
+                    "seed or env path counts as naming it.")
 
     if GH_CREATE_RE.search(cmd) and any(o in cmd.lower() for o in OWNED_GITHUB):
         return ("Blocked: an issue or PR on our own account reaches no maintainer and can never be merged. "

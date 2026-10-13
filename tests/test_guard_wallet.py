@@ -394,6 +394,40 @@ class TheSeedCannotLeave(unittest.TestCase):
         self.assertRefused("git add * && git commit -m x")
         self.assertAllowed("git add -A && git commit -m x")
 
+    def test_a_star_does_not_enter_a_dot_directory_in_a_read(self):
+        """bash without dotglob never lets `*` or `?` match a leading `.`, so `*/env` is not
+        ~/.swarm/env. Reading it as if it were refused `ls */env` and `cat config/*/env`."""
+        for c in ("ls */env", "cat config/*/env", "cat src/*/env",
+                  "find . -path '*/env' -prune -o -print"):
+            self.assertAllowed(c)
+        # /etc/swarm/env has no dot to stop it; find and ssh match with rules of their own;
+        # a bracket class is read as able to match a dot; anything not a read keeps dots matched.
+        for c in ("ls /etc/*/env", "find . -path '*/env' -exec cat {} +", "ssh host 'cat */env'",
+                  "cat [.]swarm/env", "eval x; cat */env", "rm */wallet.json"):
+            self.assertRefused(c)
+
+    def test_dots_do_not_reopen_a_rail(self):
+        for c in ("rm ~/.ssh/*", "cd ~/.ssh && rm *", "rm -f /etc/ssh/s*", "rm ~/.*/authorized_keys",
+                  "cat ~/.sw*/wallet.json", "cat /root/.swarm/*", "ls ~/.swarm/*",
+                  "shopt -s dotglob; rm ~/*/authorized_keys", "shopt -s dotglob; cat ~/*/wallet.json",
+                  "shopt -s dotglob; cat */env", "GLOBIGNORE=x; cat */env"):
+            self.assertRefused(c)
+        self.assertIn("expands globs", guard.refuse("shopt -s dotglob; cat */env"))
+        self.assertAllowed("set -euo pipefail; ls")
+
+    def test_every_command_starts_with_default_globbing(self):
+        """A login shell reads profiles; one that set dotglob would let `*/env` reach ~/.swarm/env."""
+        import subprocess, tempfile
+        import agent
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".swarm"))
+            os.makedirs(os.path.join(d, "cfg"))
+            for f in (".swarm/env", "cfg/env"):
+                open(os.path.join(d, f), "w").close()
+            out = subprocess.run(["bash", "-c", "shopt -s dotglob extglob\n" + agent.GLOB_RESET + "echo */env"],
+                                 cwd=d, capture_output=True, text=True).stdout.split()
+        self.assertEqual(out, ["cfg/env"])
+
     def test_the_too_long_refusal_says_how(self):
         self.assertIn(">>", guard.refuse("echo " + "x" * 70000))
 
